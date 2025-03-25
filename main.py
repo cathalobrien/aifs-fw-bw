@@ -1,9 +1,11 @@
 import argparse
 import torch
+import torch.distributed as dist
 import time
 import os
 import logging
 import sys
+import numpy as np
 
 #for building models
 from anemoi.models.interface import AnemoiModelInterface
@@ -91,7 +93,7 @@ def build_config(setup):
     if setup.res =="o1280":
         config.data.forcing = list(config.data.forcing).remove("insolation")
         config.data.normalizer.none = list(config.data.normalizer.none).remove("insolation")
-        config.model.num_channels=128
+        config.model.num_channels=256 #can run 128 on 1 40GB A100, or 256 on 4
 
     return config
 
@@ -114,6 +116,7 @@ def build_model(setup):
     #I am not opposed to this, but it means I have to do preproc etc
     model=AnemoiModelInterface(config=config, graph_data=graph_data, statistics=datamodule.statistics, data_indices=datamodule.data_indices, metadata=datamodule.metadata).to(device)
     
+    dist.barrier(setup.model_comm_group) 
     LOG.info(f"Model built in {time.time()-start_time:.2f}s.")
     return model
     
@@ -126,7 +129,7 @@ def iter(model,setup):
                                                    #^^^^^^^^^^^^^^^^^^^
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
-        y_pred=model.model.forward(inputs)
+        y_pred=model.model.forward(inputs, setup.model_comm_group)
         if setup.bw:
             raise ValueError("BW pass not yet implemented")
             #Need to find labels somehow
@@ -136,19 +139,34 @@ def iter(model,setup):
         
 def benchmark(model, setup, count=10, warmup=5):
     start_time=time.time()
-
+    
+    if setup.device.startswith("cuda"):
+        torch.cuda.nvtx.range_push("Warmup")
+    
     #Do warmup iters
     for _ in range(0,warmup):
         iter(model, setup)
+    torch.cuda.empty_cache()
     warmup_finish_time=time.time()
     if warmup > 0:
         LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
+
+    if setup.device.startswith("cuda"):
+        torch.cuda.nvtx.range_pop()
         
     #Do the main iters
     if setup.mem_snapshot:
         torch.cuda.memory._record_memory_history(max_entries=100_000)
+        
     for i in range(0,count):
+        if setup.device.startswith("cuda"):
+            torch.cuda.nvtx.range_push(f"iter {i}")
+
         iter(model,setup)
+
+        if setup.device.startswith("cuda"):
+            torch.cuda.nvtx.range_pop()
+            
     bm_finish_time=time.time()
     LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
     
@@ -171,12 +189,17 @@ class Setup:
         self.config_name=config_name
 
         #init parallel
-        self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel()
+        if self.device != "cuda":
+            raise ValueError("device=Cuda hardcoded in init_parallel")
+        self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel()
 
         #set device properly if running on cuda
         if self.device == "cuda":
             self.device = f"cuda:{self.local_rank}"
-            torch.cuda.set_device(self.device)
+            torch.cuda.set_device(torch.device(self.device))
+            
+    def __del__(self):
+        dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     #def __str__(self) -> str:
     #    return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
@@ -188,7 +211,17 @@ def init_parallel():
     local_rank = int(os.environ.get("SLURM_LOCALID", 0))
     procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
     num_nodes= world_size//procs_per_node
-    return global_rank, world_size, procs_per_node, num_nodes, local_rank
+    
+    if world_size > 1:
+        master_addr="localhost"; master_port="11221"
+        #world_size=world_size, rank=global_rank, device_id=local_rank
+        dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+        model_comm_group_ranks = np.arange(world_size, dtype=int)
+        model_comm_group = dist.new_group(model_comm_group_ranks)
+    else:
+        model_comm_group=None
+    
+    return model_comm_group, global_rank, world_size, procs_per_node, num_nodes, local_rank
 
 def main():
     parser = argparse.ArgumentParser()
