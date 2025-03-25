@@ -16,7 +16,10 @@ from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
 from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema
 from hydra.utils import instantiate
 
-logging.basicConfig(format='%(message)s',stream=sys.stdout, level=logging.INFO)
+log_level=logging.INFO
+if (os.getenv("SLURM_PROCID", "0") != "0"):
+    log_level=logging.WARNING
+logging.basicConfig(format='%(message)s',stream=sys.stdout, level=log_level)
 LOG = logging.getLogger(__name__) 
 logging.getLogger("anemoi").setLevel(logging.WARNING) #suppress spammy Anemoi logging
 logging.getLogger("hydra_plugins").setLevel(logging.WARNING) #and hydra
@@ -45,7 +48,9 @@ def parse_inputs(args, device):
 #(1,2,1,'n320',99) gave an error in precproc, so changed to 100 vars
 #       return F.linear(input, self.weight, self.bias)
 #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (542080x309 and 212x1024)
-def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32):
+#n320 has to be 100
+#o1280 has to 99
+def generate_inputs(res,device,shape=None,vars=99,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32):
     #  x = batch[:, 0 : self.multi_step, None, ...]  #from predict_step
     # Preparing input tensor with shape (2, 99, 6599680)
     #batch time ensemble grid vars
@@ -55,19 +60,38 @@ def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,gra
     input=torch.randn(shape,dtype=dtype, device=device, requires_grad=grad)
     return input
 
-def build_config(config_path="config", config_name="fw-bw"):
-    with initialize(version_base=None, config_path=config_path, job_name="debug"):
-        #ignore lots of missing values in the config we dont care about
-        #TODO would be nicer if hydra could chill and be lazy about MissingMandatoryValues
-        hardware_paths_data="/home/mlx/ai-ml/datasets/"
-        hardware_files_dataset="aifs-ea-an-oper-0001-mars-n320-1979-2022-6h-v4.zarr"
-        ignore_list=[f"hardware.paths.data='{hardware_paths_data}'", f"hardware.files.dataset='{hardware_files_dataset}'", "diagnostics.log.wandb.entity=''", "diagnostics.log.mlflow.tracking_uri=''", "hardware.paths.output=''", "hardware.files.graph=''"]
-        config = compose(config_name=config_name, overrides=ignore_list)
+#TODO replace this
+def get_dataset(res):
+    path="/home/mlx/ai-ml/datasets/"
+    if res == "n320":
+        return path, "aifs-ea-an-oper-0001-mars-n320-1979-2022-6h-v4.zarr"
+    elif res == "o1280":
+        return path, "aifs-ea-an-oper-0001-mars-o1280-2016-2023-6h-v1.zarr"
+    elif res == "o2560":
+        return path, "aifs-rd-an-lwda-ifc3-mars-o2560-2023-2023-6h-v3-1week.zarr"
+    else:
+        raise ValueError(f"Error. {res=} unsupported")
+    
+
+def build_config(setup):
+    with initialize(version_base=None, config_path=setup.config_path, job_name="debug"):
+        hardware_paths_data, hardware_files_dataset=get_dataset(setup.res)
+        hardware_list=[f"hardware.paths.data='{hardware_paths_data}'", f"hardware.files.dataset='{hardware_files_dataset}'"]
+        parallel_list=[f"hardware.num_gpus_per_node={setup.procs_per_node}", f"hardware.num_nodes={setup.num_nodes}"]
+        ignore_list=["diagnostics.log.wandb.entity=''", "diagnostics.log.mlflow.tracking_uri=''", "hardware.paths.output=''", "hardware.files.graph=''"]
+        overrides= hardware_list + parallel_list + ignore_list
+        config = compose(config_name=setup.config_name, overrides=overrides)
+        
     #config = OmegaConf.to_object(config)
     LOG.debug(f"{config=}")
     #config=DotDict(**config) #has to be baseschema bc DataModule calls model_dump
     config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
     
+    #change the setup slightly for o1280
+    if setup.res =="o1280":
+        config.data.forcing = list(config.data.forcing).remove("insolation")
+        config.data.normalizer.none = list(config.data.normalizer.none).remove("insolation")
+        config.model.num_channels=128
 
     return config
 
@@ -80,10 +104,8 @@ def build_model(setup):
     res=setup.res
     device=setup.device
     start_time=time.time()
-    config_path="config/"
-    config='fw-bw'
-    LOG.info(f"Building model based on '{config_path}{config}.yaml'...")
-    config=build_config(config_name=config, config_path=config_path)
+    LOG.info(f"Building model based on '{setup.config_path}{setup.config_name}.yaml'...")
+    config=build_config(setup)
     
     graph_data=get_graph_data(res)
     datamodule = AnemoiDatasetsDataModule(config, graph_data) #need training just for this
@@ -116,7 +138,7 @@ def benchmark(model, setup, count=10, warmup=5):
     start_time=time.time()
 
     #Do warmup iters
-    for i in range(0,warmup):
+    for _ in range(0,warmup):
         iter(model, setup)
     warmup_finish_time=time.time()
     if warmup > 0:
@@ -135,22 +157,29 @@ def benchmark(model, setup, count=10, warmup=5):
         torch.cuda.memory._dump_snapshot(f"mem-snapshot.pickle")
         LOG.info(f"Memory snapshot saved to ./mem-snapshot.pickle")
 
-    LOG.info(torch.cuda.memory_summary(device=setup.device))
+    #LOG.info(torch.cuda.memory_summary(device=setup.device))
         
     
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw") -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
         self.bw=bw
         self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
+        self.config_path=config_path
+        self.config_name=config_name
 
         #init parallel
-        self.global_rank, self.world_size, self.procs_per_node, self.num_nodes = init_parallel()
+        self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel()
+
+        #set device properly if running on cuda
+        if self.device == "cuda":
+            self.device = f"cuda:{self.local_rank}"
+            torch.cuda.set_device(self.device)
     
-    def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
+    #def __str__(self) -> str:
+    #    return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
         
 #Assumes each GPU is in a model comm group
 def init_parallel():
@@ -159,15 +188,15 @@ def init_parallel():
     local_rank = int(os.environ.get("SLURM_LOCALID", 0))
     procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
     num_nodes= world_size//procs_per_node
-    return global_rank, world_size, procs_per_node, num_nodes
+    return global_rank, world_size, procs_per_node, num_nodes, local_rank
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--checkpoint', default="")
     args = parser.parse_args()
     
-    setup=Setup(res="n320", dtype=torch.float16, device="cuda:0", bw=False, mem_snapshot=False)
-    LOG.info(setup)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=False)
+    #LOG.info(setup)
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
     if model is None:
@@ -178,3 +207,7 @@ def main():
     
 if __name__ == "__main__":
     main()
+    
+#TODO
+#   fix this error running o1280 over 4 procs:
+#       'RuntimeError: mat1 and mat2 shapes cannot be multiplied (6599680x212 and 210x256)'
