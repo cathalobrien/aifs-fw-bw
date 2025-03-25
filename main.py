@@ -101,6 +101,10 @@ def iter(model,setup):
         y_pred=model.model.forward(inputs)
         if setup.bw:
             raise ValueError("BW pass not yet implemented")
+            #Need to find labels somehow
+            #loss_fn(y_pred, labels).backward()
+            #optimizer.step()
+            #optimizer.zero_grad(set_to_none=True)
         
 def benchmark(model, setup, count=10, warmup=5):
     start_time=time.time()
@@ -113,18 +117,31 @@ def benchmark(model, setup, count=10, warmup=5):
         print(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
         
     #Do the main iters
+    if setup.mem_snapshot:
+        torch.cuda.memory._record_memory_history(max_entries=100_000)
     for i in range(0,count):
         iter(model,setup)
     bm_finish_time=time.time()
     print(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+    
+
+    if setup.mem_snapshot:
+        torch.cuda.memory._dump_snapshot(f"mem-snapshot.pickle")
+        print(f"Memory snapshot saved to ./mem-snapshot.pickle")
+
+    print(torch.cuda.memory_summary(device=setup.device))
         
     
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
         self.bw=bw
+        self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
+    
+    def __str__(self) -> str:
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
         
 
 def main():
@@ -132,9 +149,10 @@ def main():
     parser.add_argument('-c', '--checkpoint', default="")
     args = parser.parse_args()
     
-    setup=Setup(res="n320", dtype=torch.float16, device="cuda:0", bw=False)
+    setup=Setup(res="n320", dtype=torch.float16, device="cuda:0", bw=False, mem_snapshot=False)
+    print(setup)
     
-    model=parse_inputs(args, device=setup.device)
+    model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
     if model is None:
         model = build_model(setup)
     
