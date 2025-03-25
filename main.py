@@ -1,11 +1,12 @@
 import argparse
 import torch
-import pprint
 import time
+import os
+import logging
+import sys
 
 #for building models
 from anemoi.models.interface import AnemoiModelInterface
-from anemoi.utils.config import DotDict
 
 
 #for bulding from config :(
@@ -14,6 +15,11 @@ from omegaconf import OmegaConf
 from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
 from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema
 from hydra.utils import instantiate
+
+logging.basicConfig(format='%(message)s',stream=sys.stdout, level=logging.INFO)
+LOG = logging.getLogger(__name__) 
+logging.getLogger("anemoi").setLevel(logging.WARNING) #suppress spammy Anemoi logging
+logging.getLogger("hydra_plugins").setLevel(logging.WARNING) #and hydra
 
 def get_grid_points(res):
     if res == "o2560":
@@ -30,9 +36,9 @@ def parse_inputs(args, device):
     
     if args.checkpoint != "":
         #TODO check if args.checkpoint path is valid
-        print(f"Loading {args.checkpoint}...")
+        LOG.info(f"Loading {args.checkpoint}...")
         model = torch.load(args.checkpoint, map_location=device, weights_only=False).to(device)
-        print(f"Checkpoint loaded.")
+        LOG.info(f"Checkpoint loaded.")
         
     return model
 
@@ -58,7 +64,7 @@ def build_config(config_path="config", config_name="fw-bw"):
         ignore_list=[f"hardware.paths.data='{hardware_paths_data}'", f"hardware.files.dataset='{hardware_files_dataset}'", "diagnostics.log.wandb.entity=''", "diagnostics.log.mlflow.tracking_uri=''", "hardware.paths.output=''", "hardware.files.graph=''"]
         config = compose(config_name=config_name, overrides=ignore_list)
     #config = OmegaConf.to_object(config)
-    #pprint.pp(config)
+    LOG.debug(f"{config=}")
     #config=DotDict(**config) #has to be baseschema bc DataModule calls model_dump
     config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
     
@@ -67,7 +73,7 @@ def build_config(config_path="config", config_name="fw-bw"):
 
 def get_graph_data(res="n320"):
     graph=torch.load(f"graphs/{res}.graph", weights_only=False)
-    #pprint.pp(graph)
+    LOG.debug(f"{graph=}")
     return graph
 
 def build_model(setup):
@@ -76,7 +82,7 @@ def build_model(setup):
     start_time=time.time()
     config_path="config/"
     config='fw-bw'
-    print(f"Building model based on '{config_path}{config}.yaml'...")
+    LOG.info(f"Building model based on '{config_path}{config}.yaml'...")
     config=build_config(config_name=config, config_path=config_path)
     
     graph_data=get_graph_data(res)
@@ -86,18 +92,18 @@ def build_model(setup):
     #I am not opposed to this, but it means I have to do preproc etc
     model=AnemoiModelInterface(config=config, graph_data=graph_data, statistics=datamodule.statistics, data_indices=datamodule.data_indices, metadata=datamodule.metadata).to(device)
     
-    print(f"Model built in {time.time()-start_time:.2f}s.")
+    LOG.info(f"Model built in {time.time()-start_time:.2f}s.")
     return model
     
 def iter(model,setup):
     inputs = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
 
-    #without torch.autocast I got an error in FW pass
+    #without torch.autocast(dtype=torch.float16) I got an error in FW pass
     #     File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py", line 96, in _flash_attn_forward
     #       out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
                                                    #^^^^^^^^^^^^^^^^^^^
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
-    with torch.autocast(device_type=setup.device, dtype=torch.float16):
+    with torch.autocast(device_type=setup.device, dtype=setup.dtype):
         y_pred=model.model.forward(inputs)
         if setup.bw:
             raise ValueError("BW pass not yet implemented")
@@ -114,7 +120,7 @@ def benchmark(model, setup, count=10, warmup=5):
         iter(model, setup)
     warmup_finish_time=time.time()
     if warmup > 0:
-        print(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
+        LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
         
     #Do the main iters
     if setup.mem_snapshot:
@@ -122,14 +128,14 @@ def benchmark(model, setup, count=10, warmup=5):
     for i in range(0,count):
         iter(model,setup)
     bm_finish_time=time.time()
-    print(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+    LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
     
 
     if setup.mem_snapshot:
         torch.cuda.memory._dump_snapshot(f"mem-snapshot.pickle")
-        print(f"Memory snapshot saved to ./mem-snapshot.pickle")
+        LOG.info(f"Memory snapshot saved to ./mem-snapshot.pickle")
 
-    print(torch.cuda.memory_summary(device=setup.device))
+    LOG.info(torch.cuda.memory_summary(device=setup.device))
         
     
 class Setup:
@@ -139,10 +145,21 @@ class Setup:
         self.device = device
         self.bw=bw
         self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
+
+        #init parallel
+        self.global_rank, self.world_size, self.procs_per_node, self.num_nodes = init_parallel()
     
     def __str__(self) -> str:
         return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
         
+#Assumes each GPU is in a model comm group
+def init_parallel():
+    global_rank = int(os.environ.get("SLURM_PROCID", 0))
+    world_size = int(os.environ.get("SLURM_NTASKS", 1))
+    local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+    procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
+    num_nodes= world_size//procs_per_node
+    return global_rank, world_size, procs_per_node, num_nodes
 
 def main():
     parser = argparse.ArgumentParser()
@@ -150,7 +167,7 @@ def main():
     args = parser.parse_args()
     
     setup=Setup(res="n320", dtype=torch.float16, device="cuda:0", bw=False, mem_snapshot=False)
-    print(setup)
+    LOG.info(setup)
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
     if model is None:
