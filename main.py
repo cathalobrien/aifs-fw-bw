@@ -70,11 +70,13 @@ def get_graph_data(res="n320"):
     #pprint.pp(graph)
     return graph
 
-def build_model(res, device):
+def build_model(setup):
+    res=setup.res
+    device=setup.device
     start_time=time.time()
     config_path="config/"
     config='fw-bw'
-    print(f"Building model based on '{config_path}{config}.yaml' ...")
+    print(f"Building model based on '{config_path}{config}.yaml'...")
     config=build_config(config_name=config, config_path=config_path)
     
     graph_data=get_graph_data(res)
@@ -87,38 +89,57 @@ def build_model(res, device):
     print(f"Model built in {time.time()-start_time:.2f}s.")
     return model
     
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--checkpoint', default="")
-    args = parser.parse_args()
-    
-    device="cuda:0"
-    res="n320"
-    dtype=torch.float16
-    
-    maybe_model=parse_inputs(args, device=device)
-    if maybe_model is None:
-        model = build_model(res=res, device=device)
-    #    raise ValueError("Error, please provide a model checkpoint")
-    #pprint.pp(model)
-
-    inputs = generate_inputs(res=res,device=device, grad=True, dtype=dtype)
+def iter(model,setup):
+    inputs = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
 
     #without torch.autocast I got an error in FW pass
     #     File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py", line 96, in _flash_attn_forward
     #       out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
                                                    #^^^^^^^^^^^^^^^^^^^
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
-    print("Starting forward pass")
-    before_fw_time=time.time()
-    with torch.autocast(device_type=device, dtype=torch.float16):
+    with torch.autocast(device_type=setup.device, dtype=torch.float16):
         y_pred=model.model.forward(inputs)
-        after_fw_time=time.time()
-        print(f"FW pass completed in {after_fw_time-before_fw_time:.2f}s")
-        #y_pred.backward()
-        #after_bw_time=time.time()
-        #print(f"BW pass completed in {after_bw_time-after_fw_time:.2f}s")
+        if setup.bw:
+            raise ValueError("BW pass not yet implemented")
+        
+def benchmark(model, setup, count=10, warmup=5):
+    start_time=time.time()
+
+    #Do warmup iters
+    for i in range(0,warmup):
+        iter(model, setup)
+    warmup_finish_time=time.time()
+    if warmup > 0:
+        print(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
+        
+    #Do the main iters
+    for i in range(0,count):
+        iter(model,setup)
+    bm_finish_time=time.time()
+    print(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+        
+    
+class Setup:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True) -> None:
+        self.res = res
+        self.dtype = dtype
+        self.device = device
+        self.bw=bw
+        
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--checkpoint', default="")
+    args = parser.parse_args()
+    
+    setup=Setup(res="n320", dtype=torch.float16, device="cuda:0", bw=False)
+    
+    model=parse_inputs(args, device=setup.device)
+    if model is None:
+        model = build_model(setup)
+    
+    benchmark(model,setup)
+
     
 if __name__ == "__main__":
     main()
