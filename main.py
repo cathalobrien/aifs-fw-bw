@@ -57,13 +57,13 @@ def parse_inputs(args, device):
 #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (542080x309 and 212x1024)
 #n320 has to be 100
 #o1280 has to 99
-def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32):
+def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32,world_size=1):
     #  x = batch[:, 0 : self.multi_step, None, ...]  #from predict_step
     # Preparing input tensor with shape (2, 99, 6599680)
     #batch time ensemble grid vars
     if res == "o1280":
         vars=99
-    gridpoints=get_grid_points(res)
+    gridpoints=get_grid_points(res)//world_size
     if shape is None:
         shape=(batch,time,ensemble,gridpoints,vars)
     input=torch.randn(shape,dtype=dtype, device=device, requires_grad=grad)
@@ -163,11 +163,21 @@ def build_model(setup):
     LOG.info(f"Model built in {time.time()-start_time:.2f}s.")
     
     model.loss = get_loss(config, datamodule.data_indices, device)
+    
+    #needed for sharded batch
+    model.grid_indices = instantiate(
+            config.model_dump(by_alias=True).dataloader.grid_indices,
+            reader_group_size=setup.world_size,)
+    model.grid_indices.setup(graph_data) # need a loaded graph here
+    #model.grid_indices.grid_size = get_grid_points(res) #instead we do the FullGrid setup here
+    
     return model
     
 def iter(model,setup, verbose=False):
 
-    x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
+    x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size)
+    grid_shard_shapes = model.grid_indices.shard_shapes
+    grid_shard_slice = model.grid_indices.get_shard_indices(setup.global_rank)
     
     #without torch.autocast(dtype=torch.float16) I got an error in FW pass
     #     File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py", line 96, in _flash_attn_forward
@@ -176,7 +186,8 @@ def iter(model,setup, verbose=False):
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
         with profiler_wrapper(setup.device, "Forward"):
-            y_pred=model.model.forward(x, setup.model_comm_group)
+            y_pred=model.model.forward(x, model_comm_group=setup.model_comm_group, grid_shard_slice=grid_shard_slice, grid_shard_shapes=grid_shard_shapes)
+            #y_pred=model.model.forward(x, setup.model_comm_group)
         #x=None
         #del x
         #torch.cuda.empty_cache()
@@ -186,11 +197,12 @@ def iter(model,setup, verbose=False):
             with profiler_wrapper(setup.device,"Loss"):
                 #loss = model.loss(y_pred, y)
                 loss = dummy_loss(y_pred)
+                #loss = self.loss(y_pred_full,y_full,grid_shard_slice=grid_shard_slice,group=self.model_comm_group,)
                 #LOG.info(f"{y_pred.shape=}")
                 #target = torch.randn(get_grid_points(setup.res), setup.channels)
                 #target = torch.randn(y_pred.shape[-1], setup.channels)
                 #loss_fn = torch.nn.MSELoss()
-                #loss = loss_fn(y_pred, target)
+                #loss = loss_fn(y_pred, target, )
             
             with profiler_wrapper(setup.device,"Backward"):
                 loss.backward()
