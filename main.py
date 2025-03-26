@@ -6,6 +6,7 @@ import os
 import logging
 import sys
 import numpy as np
+from contextlib import contextmanager
 
 #for building models
 from anemoi.models.interface import AnemoiModelInterface
@@ -52,7 +53,7 @@ def parse_inputs(args, device):
 #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (542080x309 and 212x1024)
 #n320 has to be 100
 #o1280 has to 99
-def generate_inputs(res,device,shape=None,vars=99,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32):
+def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32):
     #  x = batch[:, 0 : self.multi_step, None, ...]  #from predict_step
     # Preparing input tensor with shape (2, 99, 6599680)
     #batch time ensemble grid vars
@@ -115,8 +116,10 @@ def build_model(setup):
     #brings in anemoi training dep
     #I am not opposed to this, but it means I have to do preproc etc
     model=AnemoiModelInterface(config=config, graph_data=graph_data, statistics=datamodule.statistics, data_indices=datamodule.data_indices, metadata=datamodule.metadata).to(device)
-    
-    dist.barrier(setup.model_comm_group) 
+   
+    if setup.model_comm_group is not None: 
+        dist.barrier(setup.model_comm_group)
+        
     LOG.info(f"Model built in {time.time()-start_time:.2f}s.")
     return model
     
@@ -136,46 +139,49 @@ def iter(model,setup):
             #loss_fn(y_pred, labels).backward()
             #optimizer.step()
             #optimizer.zero_grad(set_to_none=True)
-        
-def benchmark(model, setup, count=10, warmup=5):
-    start_time=time.time()
-    
-    if setup.device.startswith("cuda"):
-        torch.cuda.nvtx.range_push("Warmup")
-    
-    #Do warmup iters
-    for _ in range(0,warmup):
-        iter(model, setup)
-    torch.cuda.empty_cache()
-    warmup_finish_time=time.time()
-    if warmup > 0:
-        LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
-
-    if setup.device.startswith("cuda"):
-        torch.cuda.nvtx.range_pop()
-        
-    #Do the main iters
-    if setup.mem_snapshot:
-        torch.cuda.memory._record_memory_history(max_entries=100_000)
-        
-    for i in range(0,count):
-        if setup.device.startswith("cuda"):
-            torch.cuda.nvtx.range_push(f"iter {i}")
-
-        iter(model,setup)
-
-        if setup.device.startswith("cuda"):
-            torch.cuda.nvtx.range_pop()
             
-    bm_finish_time=time.time()
-    LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+#nvtx wrapper function
+#if a marker is given, push it
+#otherwise pop it
+#TODO replace with autograd
+@contextmanager
+def profiler_wrapper(device, marker, record_mem=False):
+    if device.startswith("cuda"):
+        if record_mem:
+            torch.cuda.memory._record_memory_history(max_entries=100_000)
+        torch.cuda.nvtx.range_push(marker)
+    yield
+    if device.startswith("cuda"):
+        torch.cuda.nvtx.range_pop()
+        if record_mem:
+            torch.cuda.memory._dump_snapshot(f"mem-snapshot.pickle")
+            LOG.info(f"Memory snapshot saved to ./mem-snapshot.pickle")
+            #torch.cuda.memory_summary(device=device)
+            
+def benchmark(models, setup, count=10, warmup=5):
     
-
-    if setup.mem_snapshot:
-        torch.cuda.memory._dump_snapshot(f"mem-snapshot.pickle")
-        LOG.info(f"Memory snapshot saved to ./mem-snapshot.pickle")
-
-    #LOG.info(torch.cuda.memory_summary(device=setup.device))
+    for model_index in range(len(models)):
+        model = models[model_index]
+        print(f"Benchmarking model {model_index}...")
+    
+        #Do warmup iters
+        start_time=time.time()
+        with profiler_wrapper(setup.device, "Warmup"):
+            for _ in range(0,warmup):
+                iter(model, setup)
+        torch.cuda.empty_cache()
+        warmup_finish_time=time.time()
+        if warmup > 0:
+            LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
+            
+        #Do the main iters
+        for i in range(0,count):
+            with profiler_wrapper(setup.device, f"iter {i}", record_mem=setup.mem_snapshot):
+                iter(model,setup)
+        bm_finish_time=time.time()
+        LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+        
+            #LOG.info(torch.cuda.memory_summary(device=setup.device))
         
     
 class Setup:
@@ -199,7 +205,8 @@ class Setup:
             torch.cuda.set_device(torch.device(self.device))
             
     def __del__(self):
-        dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
+        if dist.is_initialized():
+            dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     #def __str__(self) -> str:
     #    return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
@@ -228,14 +235,14 @@ def main():
     parser.add_argument('-c', '--checkpoint', default="")
     args = parser.parse_args()
     
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=False)
+    setup=Setup(res="n320", dtype=torch.float16, device="cuda", bw=False)
     #LOG.info(setup)
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
     if model is None:
         model = build_model(setup)
     
-    benchmark(model,setup)
+    benchmark([model],setup)
 
     
 if __name__ == "__main__":
@@ -244,3 +251,5 @@ if __name__ == "__main__":
 #TODO
 #   fix this error running o1280 over 4 procs:
 #       'RuntimeError: mat1 and mat2 shapes cannot be multiplied (6599680x212 and 210x256)'
+#   remove dependancy on datasets and graphs
+#   num_vars changes depending on the dataset, find a way to pass this info
