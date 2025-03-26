@@ -94,7 +94,7 @@ def build_config(setup):
     config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
     
     #change the setup slightly for o1280
-    if setup.res =="o1280":
+    if setup.res == "o1280":
         config.data.forcing = list(config.data.forcing).remove("insolation")
         config.data.normalizer.none = list(config.data.normalizer.none).remove("insolation")
         config.model.num_channels=256 #can run 128 on 1 40GB A100, or 256 on 4
@@ -155,24 +155,30 @@ def iter(model,setup, verbose=False):
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
         if verbose:
             LOG.info("Starting FW pass")
+        before_fw_time=time.time()
         y_pred=model.model.forward(x, setup.model_comm_group)
+        after_fw_time=time.time()
         if verbose:
             LOG.info("FW pass completed")
-        y=torch.rand_like(y_pred)
+            
         if setup.bw:
+            y=torch.rand_like(y_pred)
             #print(y_pred.shape)
             if verbose:
                 LOG.info("Computing the loss")
+            before_loss_time=time.time()
             loss = model.loss(y_pred, y)
+            after_loss_time=time.time()
             if verbose:
                 LOG.info("Starting BW pass")
+            before_bw_time=time.time()
             loss.backward()
+            after_bw_time=time.time()
             if verbose:
                 LOG.info("BW pass completed")
-            #Need to find labels somehow
-            #loss_fn(y_pred, labels).backward()
-            #optimizer.step()
-            #optimizer.zero_grad(set_to_none=True)
+            return (after_fw_time-before_fw_time,after_loss_time-before_loss_time,after_bw_time-before_bw_time)
+        else:
+            return (after_fw_time-before_fw_time,0,0)
             
 #nvtx wrapper function
 #if a marker is given, push it
@@ -192,6 +198,11 @@ def profiler_wrapper(device, marker, record_mem=False):
             LOG.info(f"Memory snapshot saved to ./mem-snapshot.pickle")
             #torch.cuda.memory_summary(device=device)
             
+def compute_times(lst):
+    length = len(lst)
+    times=tuple(f"{sum(x) / length:.4f}" for x in zip(*lst))
+    print(times)
+
 def benchmark(models, setup, count=10, warmup=5):
     
     for model_index in range(len(models)):
@@ -209,11 +220,15 @@ def benchmark(models, setup, count=10, warmup=5):
             LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
             
         #Do the main iters
+        times=list(range(count))
         for i in range(0,count):
             with profiler_wrapper(setup.device, f"iter {i}", record_mem=setup.mem_snapshot):
-                iter(model,setup)
+                times[i]=iter(model,setup)
         bm_finish_time=time.time()
         LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+        
+        compute_times(times)
+        
         
             #LOG.info(torch.cuda.memory_summary(device=setup.device))
         
