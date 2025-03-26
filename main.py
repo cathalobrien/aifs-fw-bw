@@ -19,6 +19,9 @@ from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
 from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema
 from hydra.utils import instantiate
 
+#loss
+from anemoi.training.train.forecaster import GraphForecaster
+
 log_level=logging.INFO
 if (os.getenv("SLURM_PROCID", "0") != "0"):
     log_level=logging.WARNING
@@ -103,6 +106,20 @@ def get_graph_data(res="n320"):
     LOG.debug(f"{graph=}")
     return graph
 
+def get_loss(config, data_indices,device):
+    variable_scaling = GraphForecaster.get_variable_scaling(
+            config.model_dump(by_alias=True).training.variable_loss_scaling,
+            config.model_dump(by_alias=True).training.pressure_level_scaler,
+            data_indices,
+        )
+
+    loss = GraphForecaster.get_loss_function(
+        config.training.training_loss,
+        node_weights=torch.ones(1),
+        scalars={"variable": (-1, variable_scaling), "loss_weights_mask": ((-2, -1), torch.ones((1, 1)))},
+    ).to(device)
+    return loss
+
 def build_model(setup):
     res=setup.res
     device=setup.device
@@ -121,10 +138,14 @@ def build_model(setup):
         dist.barrier(setup.model_comm_group)
         
     LOG.info(f"Model built in {time.time()-start_time:.2f}s.")
+    
+    model.loss = get_loss(config, datamodule.data_indices, device)
     return model
     
-def iter(model,setup):
-    inputs = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
+def iter(model,setup, verbose=False):
+    if verbose:
+        LOG.info("Starting FW pass")
+    x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
 
     #without torch.autocast(dtype=torch.float16) I got an error in FW pass
     #     File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py", line 96, in _flash_attn_forward
@@ -132,9 +153,22 @@ def iter(model,setup):
                                                    #^^^^^^^^^^^^^^^^^^^
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
-        y_pred=model.model.forward(inputs, setup.model_comm_group)
+        if verbose:
+            LOG.info("Starting FW pass")
+        y_pred=model.model.forward(x, setup.model_comm_group)
+        if verbose:
+            LOG.info("FW pass completed")
+        y=torch.rand_like(y_pred)
         if setup.bw:
-            raise ValueError("BW pass not yet implemented")
+            #print(y_pred.shape)
+            if verbose:
+                LOG.info("Computing the loss")
+            loss = model.loss(y_pred, y)
+            if verbose:
+                LOG.info("Starting BW pass")
+            loss.backward()
+            if verbose:
+                LOG.info("BW pass completed")
             #Need to find labels somehow
             #loss_fn(y_pred, labels).backward()
             #optimizer.step()
@@ -208,8 +242,8 @@ class Setup:
         if dist.is_initialized():
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
-    #def __str__(self) -> str:
-    #    return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}"
+    def __str__(self) -> str:
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}"
         
 #Assumes each GPU is in a model comm group
 def init_parallel():
@@ -236,7 +270,7 @@ def main():
     args = parser.parse_args()
     
     setup=Setup(res="n320", dtype=torch.float16, device="cuda", bw=False)
-    #LOG.info(setup)
+    LOG.info(str(setup))
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
     if model is None:
