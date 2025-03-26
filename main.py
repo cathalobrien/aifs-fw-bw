@@ -7,6 +7,7 @@ import logging
 import sys
 import numpy as np
 from contextlib import contextmanager
+import subprocess
 
 #for building models
 from anemoi.models.interface import AnemoiModelInterface
@@ -60,6 +61,8 @@ def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,gra
     #  x = batch[:, 0 : self.multi_step, None, ...]  #from predict_step
     # Preparing input tensor with shape (2, 99, 6599680)
     #batch time ensemble grid vars
+    if res == "o1280":
+        vars=99
     gridpoints=get_grid_points(res)
     if shape is None:
         shape=(batch,time,ensemble,gridpoints,vars)
@@ -97,7 +100,11 @@ def build_config(setup):
     if setup.res == "o1280":
         config.data.forcing = list(config.data.forcing).remove("insolation")
         config.data.normalizer.none = list(config.data.normalizer.none).remove("insolation")
-        config.model.num_channels=256 #can run 128 on 1 40GB A100, or 256 on 4
+        #config.model.num_channels=256 #can run 128 on 1 40GB A100, or 256 on 4
+    
+    if setup.channels != config.model.num_channels:
+        LOG.debug(f"Overwriting configs num_channels ({config.model.num_channels}) with the command line arg ({setup.channels})")
+        config.model.num_channels = setup.channels    
 
     return config
 
@@ -119,6 +126,22 @@ def get_loss(config, data_indices,device):
         scalars={"variable": (-1, variable_scaling), "loss_weights_mask": ((-2, -1), torch.ones((1, 1)))},
     ).to(device)
     return loss
+
+def dummy_loss(_out):
+    loss = 0
+    if isinstance(_out, torch.Tensor):
+        loss += _out.sum()
+    else:
+        for o in _out:
+            loss += o.sum()
+    return loss
+
+def reset_grad(*inputs):
+    for i in inputs:
+        if isinstance(i, torch.Tensor) and i.requires_grad:
+            i.grad = None
+        elif isinstance(i, tuple):
+            reset_grad(*i)
 
 def build_model(setup):
     res=setup.res
@@ -143,71 +166,75 @@ def build_model(setup):
     return model
     
 def iter(model,setup, verbose=False):
-    if verbose:
-        LOG.info("Starting FW pass")
-    x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
 
+    x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype)
+    
     #without torch.autocast(dtype=torch.float16) I got an error in FW pass
     #     File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py", line 96, in _flash_attn_forward
     #       out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
                                                    #^^^^^^^^^^^^^^^^^^^
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
-        if verbose:
-            LOG.info("Starting FW pass")
-        before_fw_time=time.time()
-        y_pred=model.model.forward(x, setup.model_comm_group)
-        after_fw_time=time.time()
-        if verbose:
-            LOG.info("FW pass completed")
+        with profiler_wrapper(setup.device, "Forward"):
+            y_pred=model.model.forward(x, setup.model_comm_group)
+        #x=None
+        #del x
+        #torch.cuda.empty_cache()
             
         if setup.bw:
-            y=torch.rand_like(y_pred)
-            #print(y_pred.shape)
-            if verbose:
-                LOG.info("Computing the loss")
-            before_loss_time=time.time()
-            loss = model.loss(y_pred, y)
-            after_loss_time=time.time()
-            if verbose:
-                LOG.info("Starting BW pass")
-            before_bw_time=time.time()
-            loss.backward()
-            after_bw_time=time.time()
-            if verbose:
-                LOG.info("BW pass completed")
-            return (after_fw_time-before_fw_time,after_loss_time-before_loss_time,after_bw_time-before_bw_time)
+            #y=torch.rand_like(y_pred)
+            with profiler_wrapper(setup.device,"Loss"):
+                #loss = model.loss(y_pred, y)
+                loss = dummy_loss(y_pred)
+                #LOG.info(f"{y_pred.shape=}")
+                #target = torch.randn(get_grid_points(setup.res), setup.channels)
+                #target = torch.randn(y_pred.shape[-1], setup.channels)
+                #loss_fn = torch.nn.MSELoss()
+                #loss = loss_fn(y_pred, target)
+            
+            with profiler_wrapper(setup.device,"Backward"):
+                loss.backward()
+                    
+            reset_grad(x)
+            
+            #return (forward_time,loss_time,backward_time)
+            return (0,0,0)
         else:
-            return (after_fw_time-before_fw_time,0,0)
+            return (0,0,0)
             
 #nvtx wrapper function
 #if a marker is given, push it
 #otherwise pop it
 #TODO replace with autograd
 @contextmanager
-def profiler_wrapper(device, marker, record_mem=False):
+def profiler_wrapper(device, marker, record_mem=False, verbose=False):
+    if verbose:
+        LOG.info(marker)
     if device.startswith("cuda"):
         if record_mem:
             torch.cuda.memory._record_memory_history(max_entries=100_000)
         torch.cuda.nvtx.range_push(marker)
+    start_time=time.time()
     yield
+    end_time=time.time()
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
         if record_mem:
-            torch.cuda.memory._dump_snapshot(f"mem-snapshot.pickle")
-            LOG.info(f"Memory snapshot saved to ./mem-snapshot.pickle")
+            torch.cuda.memory._dump_snapshot(f"aifs-fw-bw.pickle")
+            LOG.debug(f"Memory snapshot saved to ./aifs-fw-bw.pickle")
             #torch.cuda.memory_summary(device=device)
+    #end_time-start_time
             
 def compute_times(lst):
     length = len(lst)
     times=tuple(f"{sum(x) / length:.4f}" for x in zip(*lst))
-    print(times)
+    LOG.info(times)
 
 def benchmark(models, setup, count=10, warmup=5):
     
     for model_index in range(len(models)):
         model = models[model_index]
-        print(f"Benchmarking model {model_index}...")
+        LOG.info(f"Benchmarking model {model_index}...")
     
         #Do warmup iters
         start_time=time.time()
@@ -228,13 +255,11 @@ def benchmark(models, setup, count=10, warmup=5):
         LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
         
         compute_times(times)
-        
-        
             #LOG.info(torch.cuda.memory_summary(device=setup.device))
         
     
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw") -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
@@ -242,11 +267,14 @@ class Setup:
         self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
         self.config_path=config_path
         self.config_name=config_name
+        self.channels=channels
 
         #init parallel
         if self.device != "cuda":
             raise ValueError("device=Cuda hardcoded in init_parallel")
         self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel()
+
+        self.mem_snapshot = self.mem_snapshot and (self.global_rank == 0)
 
         #set device properly if running on cuda
         if self.device == "cuda":
@@ -258,7 +286,7 @@ class Setup:
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}"
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}"
         
 #Assumes each GPU is in a model comm group
 def init_parallel():
@@ -269,7 +297,15 @@ def init_parallel():
     num_nodes= world_size//procs_per_node
     
     if world_size > 1:
-        master_addr="localhost"; master_port="11221"
+        master_port="11221"
+        try:
+            slurm_nodelist = os.environ.get("SLURM_NODELIST", "")
+            result = subprocess.run(
+                    ["scontrol", "show", "hostname", slurm_nodelist], stdout=subprocess.PIPE, text=True, check=True
+                )
+            master_addr = result.stdout.splitlines()[0]
+        except subprocess.CalledProcessError as err:
+            master_addr="localhost"
         #world_size=world_size, rank=global_rank, device_id=local_rank
         dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
         model_comm_group_ranks = np.arange(world_size, dtype=int)
@@ -282,9 +318,11 @@ def init_parallel():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--checkpoint', default="")
+    parser.add_argument('-C', '--channels', default=128, type=int)
+    parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res="n320", dtype=torch.float16, device="cuda", bw=False)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=True, channels=args.channels)
     LOG.info(str(setup))
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
