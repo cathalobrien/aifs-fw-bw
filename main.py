@@ -415,16 +415,17 @@ def init_parallel(use_slurm=False):
         procs_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", '1'))
     num_nodes= world_size//procs_per_node
     
-    if use_slurm and world_size > 1:
-        master_port="11221"
-        try:
-            slurm_nodelist = os.environ.get("SLURM_NODELIST", "")
-            result = subprocess.run(
-                    ["scontrol", "show", "hostname", slurm_nodelist], stdout=subprocess.PIPE, text=True, check=True
-                )
-            master_addr = result.stdout.splitlines()[0]
-        except subprocess.CalledProcessError as err:
-            master_addr="localhost"
+    if world_size > 1:
+        if use_slurm:
+            master_port="11221"
+            try:
+                slurm_nodelist = os.environ.get("SLURM_NODELIST", "")
+                result = subprocess.run(
+                        ["scontrol", "show", "hostname", slurm_nodelist], stdout=subprocess.PIPE, text=True, check=True
+                    )
+                master_addr = result.stdout.splitlines()[0]
+            except subprocess.CalledProcessError as err:
+                master_addr="localhost"
 
         #TODO remove hardcoded cuda here
         if use_slurm:
