@@ -31,6 +31,8 @@ LOG = logging.getLogger(__name__)
 logging.getLogger("anemoi").setLevel(logging.WARNING) #suppress spammy Anemoi logging
 logging.getLogger("hydra_plugins").setLevel(logging.WARNING) #and hydra
 
+LOG.info("Imports completed")
+
 def get_grid_points(res):
     if res == "o2560":
         return 26306560
@@ -153,8 +155,6 @@ def build_model(setup):
     graph_data=get_graph_data(res)
     datamodule = AnemoiDatasetsDataModule(config, graph_data) #need training just for this
     
-    #brings in anemoi training dep
-    #I am not opposed to this, but it means I have to do preproc etc
     model=AnemoiModelInterface(config=config, graph_data=graph_data, statistics=datamodule.statistics, data_indices=datamodule.data_indices, metadata=datamodule.metadata).to(device)
    
     if setup.model_comm_group is not None: 
@@ -175,7 +175,8 @@ def build_model(setup):
     
 def iter(model,setup, verbose=False):
 
-    x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size)
+    with profiler_wrapper(setup.device, "Generate inputs"):
+        x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size)
     grid_shard_shapes = model.grid_indices.shard_shapes
     grid_shard_slice = model.grid_indices.get_shard_indices(setup.global_rank)
     
@@ -219,7 +220,7 @@ def iter(model,setup, verbose=False):
 #otherwise pop it
 #TODO replace with autograd
 @contextmanager
-def profiler_wrapper(device, marker, record_mem=False, verbose=False):
+def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_profiler=False):
     if verbose:
         LOG.info(marker)
     if device.startswith("cuda"):
@@ -227,7 +228,15 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False):
             torch.cuda.memory._record_memory_history(max_entries=100_000)
         torch.cuda.nvtx.range_push(marker)
     start_time=time.time()
-    yield
+    if torch_profiler:
+        record_shapes=True
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],record_shapes=record_shapes) as p:
+            yield
+        #LOG.info(p.key_averages(group_by_input_shape=record_shapes).table(sort_by="self_cuda_time_total", row_limit=10))
+        #LOG.info(p.key_averages(group_by_input_shape=record_shapes).table(row_limit=10))
+        LOG.info(p.key_averages(group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=30))
+    else:
+        yield
     end_time=time.time()
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
@@ -260,9 +269,10 @@ def benchmark(models, setup, count=10, warmup=5):
             
         #Do the main iters
         times=list(range(count))
-        for i in range(0,count):
-            with profiler_wrapper(setup.device, f"iter {i}", record_mem=setup.mem_snapshot):
-                times[i]=iter(model,setup)
+        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=True):
+            for i in range(0,count):
+                with profiler_wrapper(setup.device, f"iter {i}"):
+                    times[i]=iter(model,setup)
         bm_finish_time=time.time()
         LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
         
@@ -305,6 +315,7 @@ def init_parallel():
     global_rank = int(os.environ.get("SLURM_PROCID", 0))
     world_size = int(os.environ.get("SLURM_NTASKS", 1))
     local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+    #WARNING the below syntax for SLURM NTASKS isnt constant, on JEDI it was '4,'
     procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
     num_nodes= world_size//procs_per_node
     
@@ -330,11 +341,12 @@ def init_parallel():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--checkpoint', default="")
+    parser.add_argument('-r', '--res', default="o1280")
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=True, channels=args.channels)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels)
     LOG.info(str(setup))
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
