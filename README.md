@@ -45,7 +45,6 @@ srun -np 4 nsys profile -o nsys/aifs-fw-bw-o1280-256c.%q{SLURM_PROCID} -f true -
 ## Improvements
 * Remove requirement for dummy dataset and graph inputs
 ## bugs
-* Cant init proc group with torchrun on Atos
 * Correctness checking with a cloned compiled model passes. With a different model from the same config or an uncompiled clone it fails.
 *~~Increased mem pressure when making two models from the same config than when I clone a model~~ mercurial OOMs while checking correctness
 * Increased mem pressure while checking correctness after I merged correctness checking and torchrun/multi-config commits
