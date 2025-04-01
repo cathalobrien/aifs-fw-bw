@@ -24,7 +24,8 @@ from hydra.utils import instantiate
 from anemoi.training.train.forecaster import GraphForecaster
 
 log_level=logging.INFO
-if (os.getenv("SLURM_PROCID", "0") != "0"):
+#print(os.getenv("RANK","0"))
+if (int(os.getenv("RANK", "0")) != 0) or (int(os.getenv("SLURM_PROCID", "0")) != 0):
     log_level=logging.WARNING
 logging.basicConfig(format='%(message)s',stream=sys.stdout, level=log_level)
 LOG = logging.getLogger(__name__) 
@@ -265,22 +266,23 @@ def benchmark(models, setup, count=10, warmup=5):
         
     
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128, torch_profiler=True, compile=True) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
         self.bw=bw
         self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
         self.config_path=config_path
-        self.config_name=config_name
+        self.configs=configs.split(",")
         self.channels=channels
         self.torch_profiler=torch_profiler
         self.compile=compile
+        self.slurm=slurm
 
         #init parallel
         if self.device != "cuda":
             raise ValueError("device=Cuda hardcoded in init_parallel")
-        self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel()
+        self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel(self.slurm)
 
         self.mem_snapshot = self.mem_snapshot and (self.global_rank == 0)
 
@@ -294,15 +296,21 @@ class Setup:
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile}\n\t{self.config_name}"
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.configs=}"
         
 #Assumes each GPU is in a model comm group
-def init_parallel():
-    global_rank = int(os.environ.get("SLURM_PROCID", 0))
-    world_size = int(os.environ.get("SLURM_NTASKS", 1))
-    local_rank = int(os.environ.get("SLURM_LOCALID", 0))
-    #WARNING the below syntax for SLURM NTASKS isnt constant, on JEDI it was '4,'
-    procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
+def init_parallel(use_slurm=False):
+    if use_slurm:
+        global_rank = int(os.environ.get("SLURM_PROCID", 0))
+        world_size = int(os.environ.get("SLURM_NTASKS", 1))
+        local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+        #WARNING the below syntax for SLURM NTASKS isnt constant, on JEDI it was '4,'
+        procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
+    else:
+        global_rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        procs_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", '1'))
     num_nodes= world_size//procs_per_node
     
     if world_size > 1:
@@ -316,7 +324,11 @@ def init_parallel():
         except subprocess.CalledProcessError as err:
             master_addr="localhost"
         #world_size=world_size, rank=global_rank, device_id=local_rank
-        dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+        #dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+        if use_slurm:
+            dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+        else:
+            dist.init_process_group(backend="nccl",device_id=torch.device(f"cuda:{local_rank}"))
         model_comm_group_ranks = np.arange(world_size, dtype=int)
         model_comm_group = dist.new_group(model_comm_group_ranks)
     else:
@@ -327,20 +339,27 @@ def init_parallel():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', default="")
+    parser.add_argument('--slurm',action=argparse.BooleanOptionalAction)
     parser.add_argument('-r', '--res', default="o1280")
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
-    parser.add_argument('-c', '--config', default="aifs-fw-bw")
+    parser.add_argument('-c', '--configs', default="hackathon", type=str)
     args = parser.parse_args()
-    
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, config_name=args.config)
+
+    #configs=string(args.configs)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, configs=args.configs, slurm=args.slurm)
     LOG.info(str(setup))
     
-    model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
-    if model is None:
-        model = build_model(setup)
+    models=[]
+    for config in setup.configs:
+        setup.config_name=config #need this in some places
     
-    benchmark([model],setup)
+        model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
+        if model is None:
+            model = build_model(setup)
+        models.append(model)
+    
+    benchmark(models,setup)
 
     
 if __name__ == "__main__":
