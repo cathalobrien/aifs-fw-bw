@@ -427,8 +427,7 @@ def init_parallel(use_slurm=False):
             except subprocess.CalledProcessError as err:
                 master_addr="localhost"
 
-        #TODO remove hardcoded cuda here
-        if use_slurm:
+            #TODO remove hardcoded cuda here
             dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
         else:
             dist.init_process_group(backend="nccl",device_id=torch.device(f"cuda:{local_rank}"))
