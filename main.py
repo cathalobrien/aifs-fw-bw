@@ -60,7 +60,7 @@ def parse_inputs(args, device):
 #n320 has to be 100
 #o1280 has to 99
 #TODO get the number of vars from the dataset
-def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32,world_size=1):
+def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32,world_size=1, generator=None):
     #  x = batch[:, 0 : self.multi_step, None, ...]  #from predict_step
     # Preparing input tensor with shape (2, 99, 6599680)
     #batch time ensemble grid vars
@@ -69,7 +69,8 @@ def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,gra
     gridpoints=get_grid_points(res)//world_size
     if shape is None:
         shape=(batch,time,ensemble,gridpoints,vars)
-    input=torch.randn(shape,dtype=dtype, device=device, requires_grad=grad)
+    #if generator is not None:
+    input=torch.randn(shape,dtype=dtype, device=device, requires_grad=grad, generator=generator)
     return input
 
 #TODO replace this
@@ -154,7 +155,8 @@ def build_model(setup):
     graph_data=get_graph_data(res)
     datamodule = AnemoiDatasetsDataModule(config, graph_data) #need training just for this
     
-    model=AnemoiModelInterface(config=config, graph_data=graph_data, statistics=datamodule.statistics, data_indices=datamodule.data_indices, metadata=datamodule.metadata).to(device)
+    #keep cpu on cpu until we need it on device
+    model=AnemoiModelInterface(config=config, graph_data=graph_data, statistics=datamodule.statistics, data_indices=datamodule.data_indices, metadata=datamodule.metadata).to("cpu")
    
     if setup.model_comm_group is not None: 
         dist.barrier(setup.model_comm_group)
@@ -171,10 +173,10 @@ def build_model(setup):
     
     return model
     
-def iter(model,setup, verbose=False):
+def iter(model,setup, verbose=False, generator=None):
 
     with profiler_wrapper(setup.device, "Generate inputs"):
-        x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size)
+        x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size, generator=generator)
     grid_shard_shapes = model.grid_indices.shard_shapes
     grid_shard_slice = model.grid_indices.get_shard_indices(setup.global_rank)
     
@@ -193,18 +195,19 @@ def iter(model,setup, verbose=False):
             
             with profiler_wrapper(setup.device,"Backward"):
                 loss.backward()
-                    
+            
+            grad=x.grad
             reset_grad(x)
             
             #return (forward_time,loss_time,backward_time)
-            return (0,0,0)
+            return (y_pred,loss,grad)
         else:
-            return (0,0,0)
+            return (y_pred,0,0)
             
 #nvtx wrapper function
 #if a marker is given, push it
 @contextmanager
-def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_profiler=False):
+def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_profiler=False, mem_summary=False):
     if verbose:
         LOG.info(marker)
     if device.startswith("cuda"):
@@ -220,6 +223,9 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
     else:
         yield
     end_time=time.time()
+    if mem_summary:
+        LOG.info(torch.cuda.memory_summary(device=device))
+    #LOG.info(f"Model ran in {end_time-start_time:.2f}s")
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
         if record_mem:
@@ -231,14 +237,29 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
 def compute_times(lst):
     length = len(lst)
     times=tuple(f"{sum(x) / length:.4f}" for x in zip(*lst))
-    LOG.info(times)
+    #LOG.info(times)
 
-def benchmark(models, setup, count=10, warmup=5):
+    #TODO make checking correctness not awful
+    #check correctness has a performance penalty bc of sync copying the output tensors to cpu, and allocating pinned mem cpu tensors during BM iter 0
+    #also increases memory usage (not clear from where, results should be on CPU)
+    #further reduction in performance and increase in mem usage from deterministic algorithms
     
+def benchmark(models, setup, count=10, warmup=5):
+    outputs=[]
+    #generator=torch.Generator(device=setup.device)
     for model_index in range(len(models)):
-        model = models[model_index]
+        
+        if setup.check_correctness:
+            output = Output(count,setup.dtype) #Storing output reduces performance and increases memory pressure
+            #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
+            #I OOM when i run with torch.use_deterministic_algorithms(True) and :4096:8
+            #You should always use :16:8, perf is bad anyway but you dont OOM
+            torch.use_deterministic_algorithms(True) #[rank3]: RuntimeError: Deterministic behavior was enabled with either `torch.use_deterministic_algorithms(True)` or `at::Context::setDeterministicAlgorithms(true)`, but this operation is not deterministic because it uses CuBLAS and you have CUDA >= 10.2. To enable deterministic behavior in this case, you must set an environment variable before running your PyTorch application: CUBLAS_WORKSPACE_CONFIG=:4096:8 or CUBLAS_WORKSPACE_CONFIG=:16:8. For more information, go to https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility
+            torch.manual_seed(42)
+            
+        model = models[model_index].to(setup.device)
         if setup.compile:
-            torch.compile(model, dynamic=False)
+            model=torch.compile(model, dynamic=False)
         LOG.info(f"Benchmarking model {model_index}...")
     
         #Do warmup iters
@@ -252,20 +273,75 @@ def benchmark(models, setup, count=10, warmup=5):
             LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
             
         #Do the main iters
+        #generator.manual_seed(42)
         times=list(range(count))
-        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=setup.torch_profiler):
+        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=setup.torch_profiler, mem_summary=True):
             for i in range(0,count):
                 with profiler_wrapper(setup.device, f"iter {i}"):
-                    times[i]=iter(model,setup)
+                    results = iter(model,setup)
+                    
+                if setup.check_correctness:
+                    output.record(i, *results)
+                else:
+                    results = None
+
+                    #results =iter(model,setup)
+                    #output.record(i, results[0], results[1], results[2])
         bm_finish_time=time.time()
         LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
         
-        compute_times(times)
-            #LOG.info(torch.cuda.memory_summary(device=setup.device))
-        
+        torch.cuda.empty_cache()
+        #TODO ensure I dont have a memory leak after benchmarking a model
+        #There is a mem leak...
+        if setup.check_correctness:
+            outputs.append(output)
     
+    if setup.check_correctness: 
+        #LOG.info(f"{outputs[0] == outputs[1]=}")
+        outputs[0].compare(outputs[1])
+        
+class Output:
+    def __init__(self, len,dtype):
+        #self.y_pred=torch.empty(len, dtype=dtype, device="cpu")
+        #self.loss=torch.empty(len, dtype=dtype, device="cpu")
+        #self.grad=torch.empty(len, dtype=dtype, device="cpu")
+        self.len=len
+        self.y_pred=None
+        self.loss=None
+        self.grad=None
+        #self.y_pred=[]
+        #self.loss=[]
+        #self.grad=[]
+        
+    def __eq__(self, other):
+        y_pred_matches=torch.allclose(self.y_pred, other.y_pred)
+        loss_matches=torch.allclose(self.loss, other.loss)
+        grad_matches=torch.allclose(self.grad, other.grad)
+        return y_pred_matches and loss_matches and grad_matches
+    
+    def compare(self, other):
+        y_pred_matches=torch.allclose(self.y_pred, other.y_pred)
+        loss_matches=torch.allclose(self.loss, other.loss)
+        grad_matches=torch.allclose(self.grad, other.grad)
+        LOG.info(f"{y_pred_matches=}, {loss_matches=}, {grad_matches=}")
+    
+    def record(self, i, y_pred,loss,grad):
+        #TODO remove this from the benchmark path
+        if self.y_pred is None:
+            self.y_pred = torch.empty((self.len,*y_pred.shape), dtype=y_pred.dtype, device="cpu", pin_memory=True)
+        if self.loss is None:
+            self.loss = torch.empty((self.len,*loss.shape), dtype=loss.dtype, device="cpu", pin_memory=True)
+        if self.grad is None:
+            self.grad = torch.empty((self.len,*grad.shape), dtype=grad.dtype, device="cpu", pin_memory=True)
+        self.y_pred[i]=y_pred
+        self.loss[i]=loss
+        self.grad[i]=grad
+        #self.y_pred.append(y_pred)
+        #self.loss.append(loss)
+        #self.grad.append(grad)
+
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128, torch_profiler=True, compile=True) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128, torch_profiler=True, compile=True, check_correctness=False) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
@@ -276,6 +352,16 @@ class Setup:
         self.channels=channels
         self.torch_profiler=torch_profiler
         self.compile=compile
+        self.check_correctness=check_correctness
+        
+        if self.check_correctness:
+            if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") != ":16:8":
+                #Technincally can also use ':4096:8' which apparently has less of a perf impact but this increases memory usage further and performance is bad anyway
+                raise ValueError("Error. You requested correctness checking but did not set 'CUBLAS_WORKSPACE_CONFIG=:16:8' before running. This is required to ensure determinism from cuBLAS. Please set and rerun.")
+            LOG.info("Correctness checking enabled! performance will suffer and memory usage will increase because of this")
+        else:
+            if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") == ":16:8":
+                raise ValueError("Error! You are running with correctness checks disabled, but 'CUBLAS_WORKSPACE_CONFIG=:16:8'. This will decrease performance. Please unset and rerun.")
 
         #init parallel
         if self.device != "cuda":
@@ -294,7 +380,7 @@ class Setup:
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile}\n\t{self.config_name}"
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.config_name=}"
         
 #Assumes each GPU is in a model comm group
 def init_parallel():
@@ -331,16 +417,18 @@ def main():
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
     parser.add_argument('-c', '--config', default="aifs-fw-bw")
+    parser.add_argument('-v', '--verify', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, config_name=args.config)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, config_name=args.config, check_correctness=args.verify)
     LOG.info(str(setup))
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
     if model is None:
         model = build_model(setup)
+    model1=model
     
-    benchmark([model],setup)
+    benchmark([model,model1],setup)
 
     
 if __name__ == "__main__":
