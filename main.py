@@ -59,6 +59,7 @@ def parse_inputs(args, device):
 #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (542080x309 and 212x1024)
 #n320 has to be 100
 #o1280 has to 99
+#TODO get the number of vars from the dataset
 def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,grad=True,dtype=torch.float32,world_size=1):
     #  x = batch[:, 0 : self.multi_step, None, ...]  #from predict_step
     # Preparing input tensor with shape (2, 99, 6599680)
@@ -73,13 +74,13 @@ def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,gra
 
 #TODO replace this
 def get_dataset(res):
-    path="/home/mlx/ai-ml/datasets/"
+    path="inputs/"
     if res == "n320":
-        return path, "aifs-ea-an-oper-0001-mars-n320-1979-2022-6h-v4.zarr"
+        return path, "dummy-n320.zarr"
     elif res == "o1280":
-        return path, "aifs-ea-an-oper-0001-mars-o1280-2016-2023-6h-v1.zarr"
+        return path, "dummy-o1280.zarr"
     elif res == "o2560":
-        return path, "aifs-rd-an-lwda-ifc3-mars-o2560-2023-2023-6h-v3-1week.zarr"
+        return path, "dummy-o2560.zarr"
     else:
         raise ValueError(f"Error. {res=} unsupported")
     
@@ -93,9 +94,7 @@ def build_config(setup):
         overrides= hardware_list + parallel_list + ignore_list
         config = compose(config_name=setup.config_name, overrides=overrides)
         
-    #config = OmegaConf.to_object(config)
     LOG.debug(f"{config=}")
-    #config=DotDict(**config) #has to be baseschema bc DataModule calls model_dump
     config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
     
     #change the setup slightly for o1280
@@ -111,7 +110,7 @@ def build_config(setup):
     return config
 
 def get_graph_data(res="n320"):
-    graph=torch.load(f"graphs/{res}.graph", weights_only=False)
+    graph=torch.load(f"inputs/{res}.graph", weights_only=False)
     LOG.debug(f"{graph=}")
     return graph
 
@@ -169,7 +168,6 @@ def build_model(setup):
             config.model_dump(by_alias=True).dataloader.grid_indices,
             reader_group_size=setup.world_size,)
     model.grid_indices.setup(graph_data) # need a loaded graph here
-    #model.grid_indices.grid_size = get_grid_points(res) #instead we do the FullGrid setup here
     
     return model
     
@@ -188,22 +186,10 @@ def iter(model,setup, verbose=False):
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
         with profiler_wrapper(setup.device, "Forward"):
             y_pred=model.model.forward(x, model_comm_group=setup.model_comm_group, grid_shard_slice=grid_shard_slice, grid_shard_shapes=grid_shard_shapes)
-            #y_pred=model.model.forward(x, setup.model_comm_group)
-        #x=None
-        #del x
-        #torch.cuda.empty_cache()
             
         if setup.bw:
-            #y=torch.rand_like(y_pred)
             with profiler_wrapper(setup.device,"Loss"):
-                #loss = model.loss(y_pred, y)
                 loss = dummy_loss(y_pred)
-                #loss = self.loss(y_pred_full,y_full,grid_shard_slice=grid_shard_slice,group=self.model_comm_group,)
-                #LOG.info(f"{y_pred.shape=}")
-                #target = torch.randn(get_grid_points(setup.res), setup.channels)
-                #target = torch.randn(y_pred.shape[-1], setup.channels)
-                #loss_fn = torch.nn.MSELoss()
-                #loss = loss_fn(y_pred, target, )
             
             with profiler_wrapper(setup.device,"Backward"):
                 loss.backward()
@@ -217,8 +203,6 @@ def iter(model,setup, verbose=False):
             
 #nvtx wrapper function
 #if a marker is given, push it
-#otherwise pop it
-#TODO replace with autograd
 @contextmanager
 def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_profiler=False):
     if verbose:
@@ -232,8 +216,6 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
         record_shapes=True
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],record_shapes=record_shapes) as p:
             yield
-        #LOG.info(p.key_averages(group_by_input_shape=record_shapes).table(sort_by="self_cuda_time_total", row_limit=10))
-        #LOG.info(p.key_averages(group_by_input_shape=record_shapes).table(row_limit=10))
         LOG.info(p.key_averages(group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=30))
     else:
         yield
@@ -312,7 +294,7 @@ class Setup:
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile}"
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile}\n\t{self.config_name}"
         
 #Assumes each GPU is in a model comm group
 def init_parallel():
@@ -344,13 +326,14 @@ def init_parallel():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--checkpoint', default="")
+    parser.add_argument('--checkpoint', default="")
     parser.add_argument('-r', '--res', default="o1280")
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
+    parser.add_argument('-c', '--config', default="aifs-fw-bw")
     args = parser.parse_args()
     
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, config_name=args.config)
     LOG.info(str(setup))
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
