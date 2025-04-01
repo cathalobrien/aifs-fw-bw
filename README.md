@@ -17,12 +17,15 @@ tar xvzf $SCRATCH/graphs.tar.gz .
 # example usage
 ```bash
 #run with 'config/aifs-fw-bw.yaml', overwrites to 256 o1280 channels
-srun -n 4 python main.py -c aifs-fw-bw -C 1024 -r n320
-srun -n 4 python main.py -c aifs-fw-bw -C 256 -r o1280
-srun -n 4 python main.py -c aifs-fw-bw -C 64 -r o2560
+srun -n 4 python main.py -c aifs-fw-bw -C 1024 -r n320 --slurm
+srun -n 4 python main.py -c aifs-fw-bw -C 256 -r o1280 --slurm
+srun -n 4 python main.py -c aifs-fw-bw -C 64 -r o2560 --slurm
 
 #checking correctness
-CUBLAS_WORKSPACE_CONFIG=:16:8 srun -n 4 python main.py -C 64 -r o1280 --verify
+CUBLAS_WORKSPACE_CONFIG=:16:8 srun -n 4 python main.py -C 64 -r o1280 --slurm -c default-config,new-config --verify 
+
+#example torchrun command, benchmarking two different configs
+torchrun --nproc-per-node 4 main.py -r o1280 -C 512 -c edge,head
 ```
 
 # Checking correctness
@@ -31,8 +34,18 @@ You can use 'aifs-fw-bw' to check for equality across models. See the 'example u
 Be warned, this mode increases memory usage and heavily decreases performance. These degradations come from
 * Suboptimal output recording, via the 'Output' class. inefficiencies include allocating pinned mem buffers and syncronously copying to CPU during the BM path. The output class also increases device memory usage.
 * use of 'torch.use_deterministic_algorithms(True)' and 'CUBLAS_WORKSPACE_CONFIG=:16:8'
+* Aggresive clearing of the cache during correctness checking due to increased memory pressure => ~33% higher runtime
 
 # example NSYS usage
 ```bash
-nsys profile -o nsys/aifs-fw-bw-o1280-256c.%q{SLURM_PROCID} -f true --gpu-metrics-devices=all --cuda-memory true --python-backtrace=cuda python main.py -C 64 -r o1280
+srun -np 4 nsys profile -o nsys/aifs-fw-bw-o1280-256c.%q{SLURM_PROCID} -f true --gpu-metrics-devices=all --cuda-memory true --python-backtrace=cuda python main.py -C 64 -r o1280
 ```
+
+# TODO
+## Improvements
+* Remove requirement for dummy dataset and graph inputs
+## bugs
+* Cant init proc group with torchrun on Atos
+* Correctness checking with a cloned compiled model passes. With a different model from the same config or an uncompiled clone it fails.
+*~~Increased mem pressure when making two models from the same config than when I clone a model~~ mercurial OOMs while checking correctness
+* Increased mem pressure while checking correctness after I merged correctness checking and torchrun/multi-config commits

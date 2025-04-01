@@ -24,7 +24,8 @@ from hydra.utils import instantiate
 from anemoi.training.train.forecaster import GraphForecaster
 
 log_level=logging.INFO
-if (os.getenv("SLURM_PROCID", "0") != "0"):
+#print(os.getenv("RANK","0"))
+if (int(os.getenv("RANK", "0")) != 0) or (int(os.getenv("SLURM_PROCID", "0")) != 0):
     log_level=logging.WARNING
 logging.basicConfig(format='%(message)s',stream=sys.stdout, level=log_level)
 LOG = logging.getLogger(__name__) 
@@ -149,6 +150,8 @@ def build_model(setup):
     res=setup.res
     device=setup.device
     start_time=time.time()
+    if setup.check_correctness: #in case there's some rng in the model init phase
+        setup.reset_rng()
     LOG.info(f"Building model based on '{setup.config_path}{setup.config_name}.yaml'...")
     config=build_config(setup)
     
@@ -234,11 +237,6 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
             #torch.cuda.memory_summary(device=device)
     #end_time-start_time
             
-def compute_times(lst):
-    length = len(lst)
-    times=tuple(f"{sum(x) / length:.4f}" for x in zip(*lst))
-    #LOG.info(times)
-
     #TODO make checking correctness not awful
     #check correctness has a performance penalty bc of sync copying the output tensors to cpu, and allocating pinned mem cpu tensors during BM iter 0
     #also increases memory usage (not clear from where, results should be on CPU)
@@ -250,12 +248,10 @@ def benchmark(models, setup, count=10, warmup=5):
     for model_index in range(len(models)):
         
         if setup.check_correctness:
+            setup.reset_rng()
             output = Output(count,setup.dtype) #Storing output reduces performance and increases memory pressure
-            #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
-            #I OOM when i run with torch.use_deterministic_algorithms(True) and :4096:8
-            #You should always use :16:8, perf is bad anyway but you dont OOM
-            torch.use_deterministic_algorithms(True) #[rank3]: RuntimeError: Deterministic behavior was enabled with either `torch.use_deterministic_algorithms(True)` or `at::Context::setDeterministicAlgorithms(true)`, but this operation is not deterministic because it uses CuBLAS and you have CUDA >= 10.2. To enable deterministic behavior in this case, you must set an environment variable before running your PyTorch application: CUBLAS_WORKSPACE_CONFIG=:4096:8 or CUBLAS_WORKSPACE_CONFIG=:16:8. For more information, go to https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility
-            torch.manual_seed(42)
+            if len(models) != 2:
+                raise ValueError("Error! correctness checking requested. please rerun with 2 configs provided")
             
         model = models[model_index].to(setup.device)
         if setup.compile:
@@ -273,8 +269,6 @@ def benchmark(models, setup, count=10, warmup=5):
             LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
             
         #Do the main iters
-        #generator.manual_seed(42)
-        times=list(range(count))
         with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=setup.torch_profiler, mem_summary=True):
             for i in range(0,count):
                 with profiler_wrapper(setup.device, f"iter {i}"):
@@ -282,14 +276,16 @@ def benchmark(models, setup, count=10, warmup=5):
                     
                 if setup.check_correctness:
                     output.record(i, *results)
+                    #runtime goes from 18s to 25s with emptying the cache each iter
+                    torch.cuda.empty_cache() #big perf hit but for some reason my mem pressure has increased when checking correctness
+                    #but it gets it through the correctness checks
                 else:
                     results = None
 
-                    #results =iter(model,setup)
-                    #output.record(i, results[0], results[1], results[2])
         bm_finish_time=time.time()
         LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
         
+        model=model.to("cpu", non_blocking=True) #need this to ensure no mem leak from multiple models
         torch.cuda.empty_cache()
         #TODO ensure I dont have a memory leak after benchmarking a model
         #There is a mem leak...
@@ -298,6 +294,7 @@ def benchmark(models, setup, count=10, warmup=5):
     
     if setup.check_correctness: 
         #LOG.info(f"{outputs[0] == outputs[1]=}")
+        LOG.info(f"Checking correctness... (on the CPU, so relatively slow)")
         outputs[0].compare(outputs[1])
         
 class Output:
@@ -341,24 +338,31 @@ class Output:
         #self.grad.append(grad)
 
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128, torch_profiler=True, compile=True, check_correctness=False) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=42) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
         self.bw=bw
         self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
         self.config_path=config_path
-        self.config_name=config_name
+        self.configs=configs.split(",")
         self.channels=channels
         self.torch_profiler=torch_profiler
         self.compile=compile
         self.check_correctness=check_correctness
+        self.slurm=slurm
+        self.seed=seed
         
         if self.check_correctness:
+            #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
+            #I OOM when i run with torch.use_deterministic_algorithms(True) and :4096:8
+            #You should always use :16:8, perf is bad anyway but you dont OOM
+            torch.use_deterministic_algorithms(True) #[rank3]: RuntimeError: Deterministic behavior was enabled with either `torch.use_deterministic_algorithms(True)` or `at::Context::setDeterministicAlgorithms(true)`, but this operation is not deterministic because it uses CuBLAS and you have CUDA >= 10.2. To enable deterministic behavior in this case, you must set an environment variable before running your PyTorch application: CUBLAS_WORKSPACE_CONFIG=:4096:8 or CUBLAS_WORKSPACE_CONFIG=:16:8. For more information, go to https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility
+            self.reset_rng()
+
             if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") != ":16:8":
                 #Technincally can also use ':4096:8' which apparently has less of a perf impact but this increases memory usage further and performance is bad anyway
                 raise ValueError("Error. You requested correctness checking but did not set 'CUBLAS_WORKSPACE_CONFIG=:16:8' before running. This is required to ensure determinism from cuBLAS. Please set and rerun.")
-            LOG.info("Correctness checking enabled! performance will suffer and memory usage will increase because of this")
         else:
             if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") == ":16:8":
                 raise ValueError("Error! You are running with correctness checks disabled, but 'CUBLAS_WORKSPACE_CONFIG=:16:8'. This will decrease performance. Please unset and rerun.")
@@ -366,7 +370,7 @@ class Setup:
         #init parallel
         if self.device != "cuda":
             raise ValueError("device=Cuda hardcoded in init_parallel")
-        self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel()
+        self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel(self.slurm)
 
         self.mem_snapshot = self.mem_snapshot and (self.global_rank == 0)
 
@@ -375,23 +379,43 @@ class Setup:
             self.device = f"cuda:{self.local_rank}"
             torch.cuda.set_device(torch.device(self.device))
             
+    def reset_rng(self):
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+            
     def __del__(self):
         if dist.is_initialized():
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.config_name=}"
+        correctness_warning="Correctness checking enabled! performance will suffer and memory usage will increase because of this"
+        setup_str=f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.configs=}\n\t{self.check_correctness=}\n\t{self.slurm=}"
+        if self.check_correctness:
+            return f"{setup_str}\n{correctness_warning}"
+        else:
+            return setup_str
         
 #Assumes each GPU is in a model comm group
-def init_parallel():
-    global_rank = int(os.environ.get("SLURM_PROCID", 0))
-    world_size = int(os.environ.get("SLURM_NTASKS", 1))
-    local_rank = int(os.environ.get("SLURM_LOCALID", 0))
-    #WARNING the below syntax for SLURM NTASKS isnt constant, on JEDI it was '4,'
-    procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
+def init_parallel(use_slurm=False):
+    if use_slurm:
+        global_rank = int(os.environ.get("SLURM_PROCID", 0))
+        world_size = int(os.environ.get("SLURM_NTASKS", 1))
+        local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+        #WARNING the below syntax for SLURM NTASKS isnt constant, on JEDI it was '4,'
+        procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
+    else:
+        #Think theres a bug here. srun works but 'CUBLAS_WORKSPACE_CONFIG=:16:8 torchrun --nproc-per-node 4 main.py -r o1280 -C 64 -c aifs-fw-bw,aifs-fw-bw --verify'
+        #File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/torch_geometric/nn/conv/message_passing.py", line 239, in _set_size
+        #raise ValueError(
+        #ValueError: Encountered tensor with size 1649920 in dimension 0, but expected size 6599680.
+        #I guess the sharded reading isnt working somehow
+        global_rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        procs_per_node = int(os.environ.get("LOCAL_WORLD_SIZE", '1'))
     num_nodes= world_size//procs_per_node
     
-    if world_size > 1:
+    if use_slurm and world_size > 1:
         master_port="11221"
         try:
             slurm_nodelist = os.environ.get("SLURM_NODELIST", "")
@@ -401,8 +425,12 @@ def init_parallel():
             master_addr = result.stdout.splitlines()[0]
         except subprocess.CalledProcessError as err:
             master_addr="localhost"
-        #world_size=world_size, rank=global_rank, device_id=local_rank
-        dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+
+        #TODO remove hardcoded cuda here
+        if use_slurm:
+            dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+        else:
+            dist.init_process_group(backend="nccl",device_id=torch.device(f"cuda:{local_rank}"))
         model_comm_group_ranks = np.arange(world_size, dtype=int)
         model_comm_group = dist.new_group(model_comm_group_ranks)
     else:
@@ -413,23 +441,30 @@ def init_parallel():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', default="")
+    parser.add_argument('--slurm',action=argparse.BooleanOptionalAction)
     parser.add_argument('-r', '--res', default="o1280")
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
-    parser.add_argument('-c', '--config', default="aifs-fw-bw")
+    parser.add_argument('-c', '--configs', default="aifs-fw-bw", type=str)
     parser.add_argument('-v', '--verify', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, config_name=args.config, check_correctness=args.verify)
+    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm)
     LOG.info(str(setup))
     
-    model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
-    if model is None:
-        model = build_model(setup)
-    model1=model
+    models=[]
+    for config in setup.configs:
+        setup.config_name=config #need this in some places
     
-    benchmark([model,model1],setup)
-
+        model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
+        if model is None:
+            model = build_model(setup)
+        models.append(model)
+    
+    #model1=model
+    #models.append(model1)
+    
+    benchmark(models,setup)
     
 if __name__ == "__main__":
     main()
