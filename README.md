@@ -3,6 +3,9 @@ A lightweight benchmarking code for AIFS which does a single FW and BW pass.
 
 # setup
 ```bash
+pip install anemoi-training anemoi-models
+
+
 #need a link to config/ in aifs-fw-bw/
 ln -s anemoi-core/training/src/anemoi-training/config .
 #need graphs/ file in aifs-fw-bw/
