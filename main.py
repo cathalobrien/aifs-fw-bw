@@ -255,6 +255,8 @@ def benchmark(models, setup, count=10, warmup=5):
     
     for model_index in range(len(models)):
         model = models[model_index]
+        if setup.compile:
+            torch.compile(model, dynamic=False)
         LOG.info(f"Benchmarking model {model_index}...")
     
         #Do warmup iters
@@ -269,7 +271,7 @@ def benchmark(models, setup, count=10, warmup=5):
             
         #Do the main iters
         times=list(range(count))
-        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=True):
+        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=setup.torch_profiler):
             for i in range(0,count):
                 with profiler_wrapper(setup.device, f"iter {i}"):
                     times[i]=iter(model,setup)
@@ -281,7 +283,7 @@ def benchmark(models, setup, count=10, warmup=5):
         
     
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", config_name="fw-bw", channels=128, torch_profiler=True, compile=True) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
@@ -290,6 +292,8 @@ class Setup:
         self.config_path=config_path
         self.config_name=config_name
         self.channels=channels
+        self.torch_profiler=torch_profiler
+        self.compile=compile
 
         #init parallel
         if self.device != "cuda":
@@ -308,7 +312,7 @@ class Setup:
             dist.destroy_process_group(group=dist.group.WORLD) #prevent warning about proc group not being destroyed
     
     def __str__(self) -> str:
-        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}"
+        return f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile}"
         
 #Assumes each GPU is in a model comm group
 def init_parallel():
@@ -346,7 +350,7 @@ def main():
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels)
+    setup=Setup(res="o1280", dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False)
     LOG.info(str(setup))
     
     model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
