@@ -20,6 +20,9 @@ tar xvzf $SCRATCH/graphs.tar.gz .
 srun -n 4 python main.py -c aifs-fw-bw -C 1024 -r n320
 srun -n 4 python main.py -c aifs-fw-bw -C 256 -r o1280
 srun -n 4 python main.py -c aifs-fw-bw -C 64 -r o2560
+
+#example torchrun command, benchmarking two different configs
+torchrun --nproc-per-node 4 main.py -r o1280 -C 512 -c edge,head
 ```
 
 # example NSYS usage
