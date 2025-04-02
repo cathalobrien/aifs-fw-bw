@@ -26,6 +26,9 @@ CUBLAS_WORKSPACE_CONFIG=:16:8 srun -n 4 python main.py -C 64 -r o1280 --slurm -c
 
 #example torchrun command, benchmarking two different configs
 torchrun --nproc-per-node 4 main.py -r o1280 -C 512 -c edge,head
+
+#Mem snapshots - produces 2 snapshots 'aifs-fw-bw.head.pickle' and 'aifs-fw-bw.edge.pickle'
+torchrun --nproc-per-node 4 main.py -r o1280 -C 512 -c head,edge --mem-snapshot
 ```
 
 # Checking correctness

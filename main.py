@@ -173,12 +173,13 @@ def build_model(setup):
             config.model_dump(by_alias=True).dataloader.grid_indices,
             reader_group_size=setup.world_size,)
     model.grid_indices.setup(graph_data) # need a loaded graph here
+    model.name = f"{setup.config_name}.yaml"
     
     return model
     
 def iter(model,setup, verbose=False, generator=None):
 
-    with profiler_wrapper(setup.device, "Generate inputs"):
+    with profiler_wrapper(setup.device, "Generate inputs", model_name=model.name):
         x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size, generator=generator)
     grid_shard_shapes = model.grid_indices.shard_shapes
     grid_shard_slice = model.grid_indices.get_shard_indices(setup.global_rank)
@@ -189,14 +190,14 @@ def iter(model,setup, verbose=False, generator=None):
                                                    #^^^^^^^^^^^^^^^^^^^
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
-        with profiler_wrapper(setup.device, "Forward"):
+        with profiler_wrapper(setup.device, "Forward", model_name=model.name):
             y_pred=model.model.forward(x, model_comm_group=setup.model_comm_group, grid_shard_slice=grid_shard_slice, grid_shard_shapes=grid_shard_shapes)
             
         if setup.bw:
-            with profiler_wrapper(setup.device,"Loss"):
+            with profiler_wrapper(setup.device,"Loss", model_name=model.name):
                 loss = dummy_loss(y_pred)
             
-            with profiler_wrapper(setup.device,"Backward"):
+            with profiler_wrapper(setup.device,"Backward", model_name=model.name):
                 loss.backward()
             
             grad=x.grad
@@ -210,7 +211,9 @@ def iter(model,setup, verbose=False, generator=None):
 #nvtx wrapper function
 #if a marker is given, push it
 @contextmanager
-def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_profiler=False, mem_summary=False):
+def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_profiler=False, mem_summary=False, model_name=""):
+    if model_name != "":
+        marker = f"{model_name} - {marker}"
     if verbose:
         LOG.info(marker)
     if device.startswith("cuda"):
@@ -227,13 +230,19 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
         yield
     end_time=time.time()
     if mem_summary:
-        LOG.info(torch.cuda.memory_summary(device=device))
+        LOG.info(torch.cuda.memory_summary(device=device, abbreviated=True))
     #LOG.info(f"Model ran in {end_time-start_time:.2f}s")
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
         if record_mem:
-            torch.cuda.memory._dump_snapshot(f"aifs-fw-bw.pickle")
-            LOG.debug(f"Memory snapshot saved to ./aifs-fw-bw.pickle")
+            output_file=f"aifs-fw-bw.pickle"
+            if model_name != "":
+                output_file=f"aifs-fw-bw.{model_name}.pickle"
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            torch.cuda.memory._dump_snapshot(output_file)
+            LOG.info(f"Memory snapshot saved to ./{output_file}")
+            torch.cuda.memory._record_memory_history(enabled=None) #disable recording memory history
             #torch.cuda.memory_summary(device=device)
     #end_time-start_time
             
@@ -256,11 +265,11 @@ def benchmark(models, setup, count=10, warmup=5):
         model = models[model_index].to(setup.device)
         if setup.compile:
             model=torch.compile(model, dynamic=False)
-        LOG.info(f"Benchmarking model {model_index}...")
+        LOG.info(f"Benchmarking model {model_index}: '{model.name}'...")
     
         #Do warmup iters
         start_time=time.time()
-        with profiler_wrapper(setup.device, "Warmup"):
+        with profiler_wrapper(setup.device, "Warmup", model_name=model.name):
             for _ in range(0,warmup):
                 iter(model, setup)
         torch.cuda.empty_cache()
@@ -269,9 +278,9 @@ def benchmark(models, setup, count=10, warmup=5):
             LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
             
         #Do the main iters
-        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=setup.torch_profiler, mem_summary=True):
+        with profiler_wrapper(setup.device, f"Benchmark", record_mem=setup.mem_snapshot, torch_profiler=setup.torch_profiler, mem_summary=True, model_name=model.name):
             for i in range(0,count):
-                with profiler_wrapper(setup.device, f"iter {i}"):
+                with profiler_wrapper(setup.device, f"iter {i}", model_name=model.name):
                     results = iter(model,setup)
                     
                 if setup.check_correctness:
@@ -446,11 +455,12 @@ def main():
     parser.add_argument('-r', '--res', default="o1280")
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
+    parser.add_argument('-m','--mem-snapshot', action=argparse.BooleanOptionalAction)
     parser.add_argument('-c', '--configs', default="aifs-fw-bw", type=str)
     parser.add_argument('-v', '--verify', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=False, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm)
+    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=args.mem_snapshot, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm)
     LOG.info(str(setup))
     
     models=[]
@@ -471,7 +481,6 @@ if __name__ == "__main__":
     main()
     
 #TODO
-#   fix this error running o1280 over 4 procs:
-#       'RuntimeError: mat1 and mat2 shapes cannot be multiplied (6599680x212 and 210x256)'
 #   remove dependancy on datasets and graphs
 #   num_vars changes depending on the dataset, find a way to pass this info
+#   should I make 1 mem snapshow with all models on it?
