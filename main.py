@@ -355,12 +355,11 @@ class Setup:
             #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
             #I OOM when i run with torch.use_deterministic_algorithms(True) and :4096:8
             #You should always use :16:8, perf is bad anyway but you dont OOM
-            torch.use_deterministic_algorithms(True) #[rank3]: RuntimeError: Deterministic behavior was enabled with either `torch.use_deterministic_algorithms(True)` or `at::Context::setDeterministicAlgorithms(true)`, but this operation is not deterministic because it uses CuBLAS and you have CUDA >= 10.2. To enable deterministic behavior in this case, you must set an environment variable before running your PyTorch application: CUBLAS_WORKSPACE_CONFIG=:4096:8 or CUBLAS_WORKSPACE_CONFIG=:16:8. For more information, go to https://docs.nvidia.com/cuda/cublas/index.html#results-reproducibility
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+            torch.backends.cudnn.benchmark = False
+            torch.use_deterministic_algorithms(True) 
             self.reset_rng()
 
-            if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") != ":16:8":
-                #Technincally can also use ':4096:8' which apparently has less of a perf impact but this increases memory usage further and performance is bad anyway
-                raise ValueError("Error. You requested correctness checking but did not set 'CUBLAS_WORKSPACE_CONFIG=:16:8' before running. This is required to ensure determinism from cuBLAS. Please set and rerun.")
         else:
             if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") == ":16:8":
                 raise ValueError("Error! You are running with correctness checks disabled, but 'CUBLAS_WORKSPACE_CONFIG=:16:8'. This will decrease performance. Please unset and rerun.")

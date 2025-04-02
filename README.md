@@ -20,7 +20,7 @@ srun -n 4 python main.py -c aifs-fw-bw -C 256 -r o1280 --slurm
 srun -n 4 python main.py -c aifs-fw-bw -C 64 -r o2560 --slurm
 
 #checking correctness
-CUBLAS_WORKSPACE_CONFIG=:16:8 srun -n 4 python main.py -C 64 -r o1280 --slurm -c default-config,new-config --verify 
+srun -n 4 python main.py -C 64 -r o1280 --slurm -c default-config,new-config --verify 
 
 #example torchrun command, benchmarking two different configs
 torchrun --nproc-per-node 4 main.py -r o1280 -C 512 -c edge,head
