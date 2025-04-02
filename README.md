@@ -7,7 +7,8 @@ pip install anemoi-training anemoi-models
 
 #need a link to config/ in aifs-fw-bw/
 ln -s anemoi-core/training/src/anemoi-training/config .
-#inputs/ contains prebuilt graphs and dummy datasets
+#inputs/ contains  dummy datasets
+# The required graphs will be built on the fly
 ln -s $SCRATCH/path/to/aifs-fw-bw/inputs .
 
 ```

@@ -8,6 +8,7 @@ import sys
 import numpy as np
 from contextlib import contextmanager
 import subprocess
+from pathlib import Path
 
 #for building models
 from anemoi.models.interface import AnemoiModelInterface
@@ -17,7 +18,7 @@ from anemoi.models.interface import AnemoiModelInterface
 from hydra import compose, initialize
 from omegaconf import OmegaConf
 from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
-from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema
+from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema, convert_to_omegaconf
 from hydra.utils import instantiate
 
 #loss
@@ -107,10 +108,26 @@ def build_config(setup):
 
     return config
 
-def get_graph_data(res="n320"):
-    graph=torch.load(f"inputs/{res}.graph", weights_only=False)
-    LOG.debug(f"{graph=}")
-    return graph
+def get_graph_data(config, input_res="n320"):
+    try:
+        #graphtransformer
+        hidden_res=config.graph.nodes.hidden.node_builder.resolution
+    except:
+        hidden_res=config.graph.nodes.hidden.node_builder.grid
+    graph_filename = Path(f"inputs/{input_res}_{hidden_res}.graph")
+    if graph_filename.exists():
+        graph=torch.load(graph_filename, weights_only=False)
+        return graph
+    else:
+        LOG.info(f"'{graph_filename}' not found. Building it...")
+        from anemoi.graphs.create import GraphCreator
+
+        graph_config = convert_to_omegaconf(config).graph
+        #TODO could have race con if running this in torch distributed
+        return GraphCreator(config=graph_config).create(
+                save_path=graph_filename,
+                overwrite=False,
+            )
 
 def get_loss(config, data_indices,device):
     variable_scaling = GraphForecaster.get_variable_scaling(
@@ -151,7 +168,7 @@ def build_model(setup):
     LOG.info(f"Building model based on '{setup.config_path}{setup.config_name}.yaml'...")
     config=build_config(setup)
     
-    graph_data=get_graph_data(res)
+    graph_data=get_graph_data(config, input_res=res)
     datamodule = AnemoiDatasetsDataModule(config, graph_data) #need training just for this
     
     #keep cpu on cpu until we need it on device
@@ -197,7 +214,6 @@ def iter(model,setup, verbose=False, generator=None):
                 loss.backward()
             
             grad=x.grad
-            reset_grad(x)
             
             return (y_pred,loss,grad)
         else:
