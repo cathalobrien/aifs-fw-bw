@@ -24,7 +24,6 @@ from hydra.utils import instantiate
 from anemoi.training.train.forecaster import GraphForecaster
 
 log_level=logging.INFO
-#print(os.getenv("RANK","0"))
 if (int(os.getenv("RANK", "0")) != 0) or (int(os.getenv("SLURM_PROCID", "0")) != 0):
     log_level=logging.WARNING
 logging.basicConfig(format='%(message)s',stream=sys.stdout, level=log_level)
@@ -55,9 +54,6 @@ def parse_inputs(args, device):
         
     return model
 
-#(1,2,1,'n320',99) gave an error in precproc, so changed to 100 vars
-#       return F.linear(input, self.weight, self.bias)
-#   RuntimeError: mat1 and mat2 shapes cannot be multiplied (542080x309 and 212x1024)
 #n320 has to be 100
 #o1280 has to 99
 #TODO get the number of vars from the dataset
@@ -203,7 +199,6 @@ def iter(model,setup, verbose=False, generator=None):
             grad=x.grad
             reset_grad(x)
             
-            #return (forward_time,loss_time,backward_time)
             return (y_pred,loss,grad)
         else:
             return (y_pred,0,0)
@@ -220,7 +215,6 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
         if record_mem:
             torch.cuda.memory._record_memory_history(max_entries=100_000)
         torch.cuda.nvtx.range_push(marker)
-    start_time=time.time()
     if torch_profiler:
         record_shapes=True
         with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],record_shapes=record_shapes) as p:
@@ -228,10 +222,8 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
         LOG.info(p.key_averages(group_by_input_shape=True).table(sort_by="self_cuda_time_total", row_limit=30))
     else:
         yield
-    end_time=time.time()
     if mem_summary:
         LOG.info(torch.cuda.memory_summary(device=device, abbreviated=True))
-    #LOG.info(f"Model ran in {end_time-start_time:.2f}s")
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
         if record_mem:
@@ -243,8 +235,6 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
             torch.cuda.memory._dump_snapshot(output_file)
             LOG.info(f"Memory snapshot saved to ./{output_file}")
             torch.cuda.memory._record_memory_history(enabled=None) #disable recording memory history
-            #torch.cuda.memory_summary(device=device)
-    #end_time-start_time
             
     #TODO make checking correctness not awful
     #check correctness has a performance penalty bc of sync copying the output tensors to cpu, and allocating pinned mem cpu tensors during BM iter 0
@@ -308,16 +298,10 @@ def benchmark(models, setup, count=10, warmup=5):
         
 class Output:
     def __init__(self, len,dtype):
-        #self.y_pred=torch.empty(len, dtype=dtype, device="cpu")
-        #self.loss=torch.empty(len, dtype=dtype, device="cpu")
-        #self.grad=torch.empty(len, dtype=dtype, device="cpu")
         self.len=len
         self.y_pred=None
         self.loss=None
         self.grad=None
-        #self.y_pred=[]
-        #self.loss=[]
-        #self.grad=[]
         
     def __eq__(self, other):
         y_pred_matches=torch.allclose(self.y_pred, other.y_pred)
@@ -329,10 +313,15 @@ class Output:
         y_pred_matches=torch.allclose(self.y_pred, other.y_pred)
         loss_matches=torch.allclose(self.loss, other.loss)
         grad_matches=torch.allclose(self.grad, other.grad)
+        if not grad_matches:
+            grad_absdiff = torch.abs(self.grad) - torch.abs(other.grad)
+            #vmap_allclose = torch.vmap(torch.allclose)
+            #grad_matches_per_step = vmap_allclose(self.grad, other.grad)
+            LOG.info(f"{torch.max(grad_absdiff)=}")
         LOG.info(f"{y_pred_matches=}, {loss_matches=}, {grad_matches=}")
     
     def record(self, i, y_pred,loss,grad):
-        #TODO remove this from the benchmark path
+        #TODO remove pinned memory allocation from the benchmark path
         if self.y_pred is None:
             self.y_pred = torch.empty((self.len,*y_pred.shape), dtype=y_pred.dtype, device="cpu", pin_memory=True)
         if self.loss is None:
@@ -342,12 +331,9 @@ class Output:
         self.y_pred[i]=y_pred
         self.loss[i]=loss
         self.grad[i]=grad
-        #self.y_pred.append(y_pred)
-        #self.loss.append(loss)
-        #self.grad.append(grad)
 
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=42) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
@@ -360,7 +346,10 @@ class Setup:
         self.compile=compile
         self.check_correctness=check_correctness
         self.slurm=slurm
-        self.seed=seed
+        if seed is None:
+            self.seed = int(time.time())
+        else:
+            self.seed=seed
         
         if self.check_correctness:
             #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
@@ -398,7 +387,7 @@ class Setup:
     
     def __str__(self) -> str:
         correctness_warning="Correctness checking enabled! performance will suffer and memory usage will increase because of this"
-        setup_str=f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.configs=}\n\t{self.check_correctness=}\n\t{self.slurm=}"
+        setup_str=f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.configs=}\n\t{self.check_correctness=}\n\t{self.slurm=}\n\t{self.seed=}"
         if self.check_correctness:
             return f"{setup_str}\n{correctness_warning}"
         else:
@@ -410,14 +399,8 @@ def init_parallel(use_slurm=False):
         global_rank = int(os.environ.get("SLURM_PROCID", 0))
         world_size = int(os.environ.get("SLURM_NTASKS", 1))
         local_rank = int(os.environ.get("SLURM_LOCALID", 0))
-        #WARNING the below syntax for SLURM NTASKS isnt constant, on JEDI it was '4,'
         procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
     else:
-        #Think theres a bug here. srun works but 'CUBLAS_WORKSPACE_CONFIG=:16:8 torchrun --nproc-per-node 4 main.py -r o1280 -C 64 -c aifs-fw-bw,aifs-fw-bw --verify'
-        #File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/torch_geometric/nn/conv/message_passing.py", line 239, in _set_size
-        #raise ValueError(
-        #ValueError: Encountered tensor with size 1649920 in dimension 0, but expected size 6599680.
-        #I guess the sharded reading isnt working somehow
         global_rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
         local_rank = int(os.environ.get("LOCAL_RANK", 0))

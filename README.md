@@ -5,13 +5,11 @@ A lightweight benchmarking code for AIFS which does a single FW and BW pass.
 ```bash
 pip install anemoi-training anemoi-models
 
-
 #need a link to config/ in aifs-fw-bw/
 ln -s anemoi-core/training/src/anemoi-training/config .
-#need graphs/ file in aifs-fw-bw/
-tar xvzf $SCRATCH/graphs.tar.gz .
+#inputs/ contains prebuilt graphs and dummy datasets
+ln -s $SCRATCH/path/to/aifs-fw-bw/inputs .
 
-#might need to edit datasets path in 'get_dataset()'
 ```
 
 # example usage
