@@ -44,13 +44,13 @@ def get_grid_points(res):
     else:
         return 0
 
-def parse_inputs(args, device):
+def parse_inputs(args):
     model=None
     
     if args.checkpoint != "":
         #TODO check if args.checkpoint path is valid
         LOG.info(f"Loading {args.checkpoint}...")
-        model = torch.load(args.checkpoint, map_location=device, weights_only=False).to(device)
+        model = torch.load(args.checkpoint, map_location="cpu", weights_only=False).to("cpu") #will be sent to device at runtime
         LOG.info(f"Checkpoint loaded.")
         
     return model
@@ -85,6 +85,9 @@ def get_dataset(res):
     
 
 def build_config(setup):
+    filename=f"{setup.config_path}/{setup.config_name}.yaml"
+    if not os.path.isfile(filename):
+        raise ValueError(f"'{filename}' not found")
     with initialize(version_base=None, config_path=setup.config_path, job_name="debug"):
         hardware_paths_data, hardware_files_dataset=get_dataset(setup.res)
         hardware_list=[f"hardware.paths.data='{hardware_paths_data}'", f"hardware.files.dataset='{hardware_files_dataset}'"]
@@ -461,7 +464,7 @@ def main():
     parser.add_argument('-C', '--channels', default=128, type=int)
     parser.add_argument('-f','--forward', action=argparse.BooleanOptionalAction)
     parser.add_argument('-m','--mem-snapshot', action=argparse.BooleanOptionalAction)
-    parser.add_argument('-c', '--configs', default="aifs-fw-bw", type=str)
+    parser.add_argument('-c', '--configs', required=True, type=str, help="Comma-seperated list of configs to benchmark e.g. '-c default' -> config/default.yaml")
     parser.add_argument('-v', '--verify', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
@@ -472,7 +475,7 @@ def main():
     for config in setup.configs:
         setup.config_name=config #need this in some places
     
-        model=parse_inputs(args, device=setup.device) #optionally load model from checkpoint if given
+        model=parse_inputs(args) #optionally load model from checkpoint if given
         if model is None:
             model = build_model(setup)
         models.append(model)
