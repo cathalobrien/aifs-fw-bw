@@ -109,12 +109,14 @@ def build_config(setup):
     return config
 
 def get_graph_data(config, input_res="n320"):
+    #TODO doesnt build graphs for transformer models correctly
     try:
         #graphtransformer
         hidden_res=config.graph.nodes.hidden.node_builder.resolution
     except:
         hidden_res=config.graph.nodes.hidden.node_builder.grid
     graph_filename = Path(f"inputs/{input_res}_{hidden_res}.graph")
+    print(graph_filename)
     if graph_filename.exists():
         graph=torch.load(graph_filename, weights_only=False)
         return graph
@@ -240,6 +242,7 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
         yield
     if mem_summary:
         LOG.info(torch.cuda.memory_summary(device=device, abbreviated=True))
+        torch.cuda.reset_peak_memory_stats(device=device)
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
         if record_mem:
