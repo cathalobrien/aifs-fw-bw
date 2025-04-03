@@ -6,6 +6,6 @@ anemoi-core/
 inputs
 *.tar.gz
 *.pickle
-config/
+config
 nsys/
 env.sh

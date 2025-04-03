@@ -64,6 +64,8 @@ def generate_inputs(res,device,shape=None,vars=100,batch=1,time=2,ensemble=1,gra
     #batch time ensemble grid vars
     if res == "o1280":
         vars=99
+    elif res == "o2560":
+        vars=98
     gridpoints=get_grid_points(res)//world_size
     if shape is None:
         shape=(batch,time,ensemble,gridpoints,vars)
