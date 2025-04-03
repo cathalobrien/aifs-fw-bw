@@ -3,8 +3,9 @@
 .vscode/
 __pycache__/
 anemoi-core/
-inputs/
+inputs
 *.tar.gz
 *.pickle
 config/
 nsys/
+env.sh

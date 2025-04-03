@@ -15,6 +15,9 @@ ln -s $SCRATCH/path/to/aifs-fw-bw/inputs .
 
 # example usage
 ```bash
+#get a gpu node
+salloc --mem=0 --qos=ng -N 1 --ntasks-per-node=4 --cpus-per-task=32 --gpus-per-task=1 --time=2:00:00
+
 #run with 'config/aifs-fw-bw.yaml', overwrites to 256 o1280 channels
 srun -n 4 python main.py -c aifs-fw-bw -C 1024 -r n320 --slurm
 srun -n 4 python main.py -c aifs-fw-bw -C 256 -r o1280 --slurm
@@ -40,7 +43,9 @@ Be warned, this mode increases memory usage and heavily decreases performance. T
 
 # example NSYS usage
 ```bash
-srun -np 4 nsys profile -o nsys/aifs-fw-bw-o1280-256c.%q{SLURM_PROCID} -f true --gpu-metrics-devices=all --cuda-memory true --python-backtrace=cuda python main.py -C 64 -r o1280
+srun -np 4 nsys profile -o nsys/aifs-fw-bw-o1280-256c.%q{SLURM_PROCID} -f true --gpu-metrics-device=all --cuda-memory true --python-backtrace=cuda --python-sampling=true python main.py -C 64 -r o1280
+#torchrun example
+torchrun --no-python --nproc-per-node 4 nsys profile -o aifs-9km-1024c-8mc.%q{RANK} -f true --gpu-metrics-device=all --cuda-memory true --python-backtrace=cuda python main.py -r o1280 -C 1024 -c hackathon
 ```
 
 # TODO

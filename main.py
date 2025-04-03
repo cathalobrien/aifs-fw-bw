@@ -111,7 +111,7 @@ def build_config(setup):
 
     return config
 
-def get_graph_data(config, input_res="n320"):
+def get_graph_data(config, input_res="n320", comm_group=None):
     #TODO doesnt build graphs for transformer models correctly
     try:
         #graphtransformer
@@ -124,15 +124,25 @@ def get_graph_data(config, input_res="n320"):
         return graph
     else:
         LOG.info(f"'{graph_filename}' not found. Building it...")
-        LOG.info("WARNING buildign the graph is buggy at the moment when running with multiple procs. just run it 2 or 3 times and it will work")
         from anemoi.graphs.create import GraphCreator
-
-        graph_config = convert_to_omegaconf(config).graph
-        #TODO could have race con if running this in torch distributed
-        return GraphCreator(config=graph_config).create(
+        if comm_group is None:
+            graph_config = convert_to_omegaconf(config).graph
+            return GraphCreator(config=graph_config).create(
                 save_path=graph_filename,
-                overwrite=False,
-            )
+                overwrite=False)
+        else: #multiprocessing -> only proc zero builds graph
+            rank = dist.get_rank(comm_group)
+            if rank == 0:
+                graph_config = convert_to_omegaconf(config).graph
+                graph = GraphCreator(config=graph_config).create(
+                save_path=graph_filename,
+                overwrite=True)
+                dist.barrier(comm_group)
+                return graph
+            else:
+                dist.barrier(comm_group)
+                graph=torch.load(graph_filename, weights_only=False)
+                return graph
 
 def get_loss(config, data_indices,device):
     variable_scaling = GraphForecaster.get_variable_scaling(
@@ -173,7 +183,7 @@ def build_model(setup):
     LOG.info(f"Building model based on '{setup.config_path}{setup.config_name}.yaml'...")
     config=build_config(setup)
     
-    graph_data=get_graph_data(config, input_res=res)
+    graph_data=get_graph_data(config, input_res=res, comm_group=setup.model_comm_group)
     datamodule = AnemoiDatasetsDataModule(config, graph_data) #need training just for this
     
     #keep cpu on cpu until we need it on device
@@ -196,7 +206,6 @@ def build_model(setup):
     return model
     
 def iter(model,setup, verbose=False, generator=None):
-
     with profiler_wrapper(setup.device, "Generate inputs", model_name=model.name):
         x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size, generator=generator)
     grid_shard_shapes = model.grid_indices.shard_shapes
