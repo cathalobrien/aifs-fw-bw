@@ -1,0 +1,10 @@
+*.out
+*.nsys-rep
+.vscode/
+__pycache__/
+anemoi-core/
+inputs/
+*.tar.gz
+*.pickle
+config/
+nsys/
