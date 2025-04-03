@@ -116,12 +116,12 @@ def get_graph_data(config, input_res="n320"):
     except:
         hidden_res=config.graph.nodes.hidden.node_builder.grid
     graph_filename = Path(f"inputs/{input_res}_{hidden_res}.graph")
-    print(graph_filename)
     if graph_filename.exists():
         graph=torch.load(graph_filename, weights_only=False)
         return graph
     else:
         LOG.info(f"'{graph_filename}' not found. Building it...")
+        LOG.info("WARNING buildign the graph is buggy at the moment when running with multiple procs. just run it 2 or 3 times and it will work")
         from anemoi.graphs.create import GraphCreator
 
         graph_config = convert_to_omegaconf(config).graph
@@ -220,7 +220,7 @@ def iter(model,setup, verbose=False, generator=None):
             return (y_pred,loss,grad)
         else:
             return (y_pred,0,0)
-            
+           
 #nvtx wrapper function
 #if a marker is given, push it
 @contextmanager
@@ -301,7 +301,8 @@ def benchmark(models, setup, count=10, warmup=5):
                     results = None
 
         bm_finish_time=time.time()
-        LOG.info(f"{count} iterations completed in {bm_finish_time - warmup_finish_time:.2f}s")
+        bm_time=bm_finish_time - warmup_finish_time
+        LOG.info(f"{count} iterations completed in {bm_time:.2f}s ({count/bm_time:.2f} iter/s)")
         
         model=model.to("cpu", non_blocking=True) #need this to ensure no mem leak from multiple models
         torch.cuda.empty_cache()
@@ -365,10 +366,14 @@ class Setup:
         self.compile=compile
         self.check_correctness=check_correctness
         self.slurm=slurm
+        self.warn_about_syncs=False
         if seed is None:
             self.seed = int(time.time())
         else:
             self.seed=seed
+
+        if self.warn_about_syncs:
+            torch.cuda.set_sync_debug_mode(1) 
         
         if self.check_correctness:
             #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
