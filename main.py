@@ -24,6 +24,9 @@ from hydra.utils import instantiate
 #loss
 from anemoi.training.train.forecaster import GraphForecaster
 
+#checkpointing
+from anemoi.training.utils.checkpoint import save_inference_checkpoint
+
 log_level=logging.INFO
 if (int(os.getenv("RANK", "0")) != 0) or (int(os.getenv("SLURM_PROCID", "0")) != 0):
     log_level=logging.WARNING
@@ -200,10 +203,10 @@ def build_model(setup):
     
     #needed for sharded batch
     model.grid_indices = instantiate(
-            config.model_dump(by_alias=True).dataloader.grid_indices,
-            reader_group_size=setup.world_size,)
+        config.model_dump(by_alias=True).dataloader.grid_indices,
+        reader_group_size=setup.world_size,)
     model.grid_indices.setup(graph_data) # need a loaded graph here
-    model.name = f"{setup.config_name}.yaml"
+    model.name = f"{setup.config_name}"
     
     return model
     
@@ -260,19 +263,28 @@ def profiler_wrapper(device, marker, record_mem=False, verbose=False, torch_prof
     if device.startswith("cuda"):
         torch.cuda.nvtx.range_pop()
         if record_mem:
-            output_file=f"aifs-fw-bw.pickle"
+            current_dir=Path().resolve()
+            output_file=f"{current_dir}/aifs-fw-bw.pickle"
             if model_name != "":
-                output_file=f"aifs-fw-bw.{model_name}.pickle"
+                output_file=f"{current_dir}/aifs-fw-bw.{model_name}.pickle"
             if os.path.exists(output_file):
                 os.remove(output_file)
             torch.cuda.memory._dump_snapshot(output_file)
-            LOG.info(f"Memory snapshot saved to ./{output_file}")
+            LOG.info(f"Memory snapshot saved to {output_file}")
             torch.cuda.memory._record_memory_history(enabled=None) #disable recording memory history
             
     #TODO make checking correctness not awful
     #check correctness has a performance penalty bc of sync copying the output tensors to cpu, and allocating pinned mem cpu tensors during BM iter 0
     #also increases memory usage (not clear from where, results should be on CPU)
     #further reduction in performance and increase in mem usage from deterministic algorithms
+    
+def save_inf_checkpoint(model,setup):
+    metadata = dict(**model.metadata)
+    save_path=f"{os.getenv('SCRATCH')}/obrien2/aifs-fw-bw/checkpoints"
+    file_name=f"{model.name}.ckpt"
+    if setup.global_rank == 0:
+        save_inference_checkpoint(model, metadata, f"{save_path}/{file_name}")
+        LOG.info(f"Checkpoint saved to '{save_path}/inference-{file_name}'")
     
 def benchmark(models, setup, count=10, warmup=5):
     outputs=[]
@@ -324,6 +336,10 @@ def benchmark(models, setup, count=10, warmup=5):
         #There is a mem leak...
         if setup.check_correctness:
             outputs.append(output)
+
+        if setup.save_checkpoint:
+            save_inf_checkpoint(model,setup)
+            
     
     if setup.check_correctness: 
         #LOG.info(f"{outputs[0] == outputs[1]=}")
@@ -367,7 +383,7 @@ class Output:
         self.grad[i]=grad
 
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None, save_checkpoint=False) -> None:
         self.res = res
         self.dtype = dtype
         self.device = device
@@ -381,6 +397,9 @@ class Setup:
         self.check_correctness=check_correctness
         self.slurm=slurm
         self.warn_about_syncs=False
+            #if self.bw #could check if FAv3 is in use and error out
+        self.save_checkpoint=save_checkpoint
+        
         if seed is None:
             self.seed = int(time.time())
         else:
@@ -397,6 +416,7 @@ class Setup:
             torch.backends.cudnn.benchmark = False
             torch.use_deterministic_algorithms(True) 
             self.reset_rng()
+            #if self.bw #could check if FAv3 is in use and error out
 
         else:
             if os.getenv("CUBLAS_WORKSPACE_CONFIG", "0") == ":16:8":
@@ -477,9 +497,10 @@ def main():
     parser.add_argument('-m','--mem-snapshot', action=argparse.BooleanOptionalAction)
     parser.add_argument('-c', '--configs', required=True, type=str, help="Comma-seperated list of configs to benchmark e.g. '-c default' -> config/default.yaml")
     parser.add_argument('-v', '--verify', action=argparse.BooleanOptionalAction)
+    parser.add_argument('-s', '--save-checkpoint', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=args.mem_snapshot, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm)
+    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=args.mem_snapshot, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm, save_checkpoint=args.save_checkpoint)
     LOG.info(str(setup))
     
     models=[]
