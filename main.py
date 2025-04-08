@@ -118,30 +118,39 @@ def build_config(setup):
 
 def get_graph_data(config, input_res="n320", hidden_res="o96", comm_group=None):
     graph_filename = Path(f"inputs/{input_res}_{hidden_res}.graph")
-    if graph_filename.exists():
-        graph=torch.load(graph_filename, weights_only=False)
-        return graph
-    else:
+
+    if not graph_filename.exists():
         LOG.info(f"'{graph_filename}' not found. Building it...")
+        graph_config = convert_to_omegaconf(config).graph
+
+        #if "nodes.hidden.node_builder.grid" in graph_config:
+        #    graph_config.nodes.hidden.node_builder.grid = hidden_res
+        #else:
+        #    graph_config.nodes.hidden.node_builder.resolution = hidden_res
+
+        #overwrite default hidden_res
+        graph_config.nodes.hidden.node_builder.grid = hidden_res
+        #graph_config.nodes.hidden.node_builder.resolution = hidden_res
+
         from anemoi.graphs.create import GraphCreator
         if comm_group is None:
-            graph_config = convert_to_omegaconf(config).graph
-            return GraphCreator(config=graph_config).create(
+            GraphCreator(config=graph_config).create(
                 save_path=graph_filename,
-                overwrite=False)
+                overwrite=True)
         else: #multiprocessing -> only proc zero builds graph
             rank = dist.get_rank(comm_group)
             if rank == 0:
-                graph_config = convert_to_omegaconf(config).graph
-                graph = GraphCreator(config=graph_config).create(
+                GraphCreator(config=graph_config).create(
                 save_path=graph_filename,
                 overwrite=True)
                 dist.barrier(comm_group)
-                return graph
             else:
                 dist.barrier(comm_group)
-                graph=torch.load(graph_filename, weights_only=False)
-                return graph
+    graph=torch.load(graph_filename, weights_only=False)
+    if (comm_group is None or dist.get_rank(comm_group) == 0):
+        os.system(f"anemoi-graphs describe {graph_filename}")
+    return graph
+    
 
 def get_loss(config, data_indices,device):
     variable_scaling = GraphForecaster.get_variable_scaling(
@@ -282,6 +291,7 @@ def save_inf_checkpoint(model,setup):
     
 def benchmark(models, setup, count=10, warmup=5):
     outputs=[]
+
     #generator=torch.Generator(device=setup.device)
     for model_index in range(len(models)):
         
@@ -294,6 +304,11 @@ def benchmark(models, setup, count=10, warmup=5):
         model = models[model_index].to(setup.device)
         if setup.compile:
             model=torch.compile(model, dynamic=False)
+
+        #do it now to avoid warning during model setup
+        if setup.warn_about_syncs:
+            torch.cuda.set_sync_debug_mode(1) 
+        
         LOG.info(f"Benchmarking model {model_index}: '{model.name}'...")
     
         #Do warmup iters
@@ -332,6 +347,9 @@ def benchmark(models, setup, count=10, warmup=5):
 
         if setup.save_checkpoint:
             save_inf_checkpoint(model,setup)
+
+        if setup.warn_about_syncs:
+            torch.cuda.set_sync_debug_mode(0)
             
     
     if setup.check_correctness: 
@@ -376,7 +394,7 @@ class Output:
         self.grad[i]=grad
 
 class Setup:
-    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None, save_checkpoint=False) -> None:
+    def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None, save_checkpoint=False, warn_about_syncs=False) -> None:
         self.res, self.hidden_res = self.parse_res(res)
         self.dtype = dtype
         self.device = device
@@ -389,7 +407,7 @@ class Setup:
         self.compile=compile
         self.check_correctness=check_correctness
         self.slurm=slurm
-        self.warn_about_syncs=False
+        self.warn_about_syncs=warn_about_syncs
         self.save_checkpoint=save_checkpoint
         
         if seed is None:
@@ -397,9 +415,6 @@ class Setup:
         else:
             self.seed=seed
 
-        if self.warn_about_syncs:
-            torch.cuda.set_sync_debug_mode(1) 
-        
         if self.check_correctness:
             #:16:8 (may limit overall performance) or :4096:8 (will increase library footprint in GPU memory by approximately 24MiB).
             #I OOM when i run with torch.use_deterministic_algorithms(True) and :4096:8
@@ -431,7 +446,6 @@ class Setup:
     def parse_res(self,res):
         default_hidden_res="o96"
         res_list=res.split(",")
-        LOG.info(f"{res_list=}")
         if len(res_list) >2:
             raise ValueError(f"Error. {len(res)} resolutions provided! expected format is either '-r input_grid' or '-r input_grid,hidden_grid'")
         if len(res_list) == 2:
@@ -450,7 +464,7 @@ class Setup:
     
     def __str__(self) -> str:
         correctness_warning="Correctness checking enabled! performance will suffer and memory usage will increase because of this"
-        setup_str=f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.configs=}\n\t{self.check_correctness=}\n\t{self.slurm=}\n\t{self.seed=}"
+        setup_str=f"Benchmarking setup:\n\t{self.res=}\n\t{self.dtype=}\n\t{self.device=}\n\t{self.bw=}\n\t{self.mem_snapshot=}\n\t{self.procs_per_node=}\n\t{self.num_nodes=}\n\t{self.channels=}\n\t{self.torch_profiler=}\n\t{self.compile=}\n\t{self.configs=}\n\t{self.check_correctness=}\n\t{self.slurm=}\n\t{self.seed=}\n\t{self.warn_about_syncs=}"
         if self.check_correctness:
             return f"{setup_str}\n{correctness_warning}"
         else:
@@ -505,9 +519,10 @@ def main():
     parser.add_argument('-c', '--configs', required=True, type=str, help="Comma-seperated list of configs to benchmark e.g. '-c default' -> config/default.yaml")
     parser.add_argument('-v', '--verify', action=argparse.BooleanOptionalAction)
     parser.add_argument('-s', '--save-checkpoint', action=argparse.BooleanOptionalAction)
+    parser.add_argument('-w', '--warn-about-syncs', action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     
-    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=args.mem_snapshot, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm, save_checkpoint=args.save_checkpoint)
+    setup=Setup(res=args.res, dtype=torch.float16, device="cuda", bw=(not args.forward), mem_snapshot=args.mem_snapshot, channels=args.channels, torch_profiler=False, configs=args.configs, check_correctness=args.verify, slurm=args.slurm, save_checkpoint=args.save_checkpoint, warn_about_syncs=args.warn_about_syncs)
     LOG.info(str(setup))
     
     models=[]
