@@ -116,13 +116,7 @@ def build_config(setup):
 
     return config
 
-def get_graph_data(config, input_res="n320", comm_group=None):
-    #TODO doesnt build graphs for transformer models correctly
-    try:
-        #graphtransformer
-        hidden_res=config.graph.nodes.hidden.node_builder.resolution
-    except:
-        hidden_res=config.graph.nodes.hidden.node_builder.grid
+def get_graph_data(config, input_res="n320", hidden_res="o96", comm_group=None):
     graph_filename = Path(f"inputs/{input_res}_{hidden_res}.graph")
     if graph_filename.exists():
         graph=torch.load(graph_filename, weights_only=False)
@@ -188,7 +182,7 @@ def build_model(setup):
     LOG.info(f"Building model based on '{setup.config_path}{setup.config_name}.yaml'...")
     config=build_config(setup)
     
-    graph_data=get_graph_data(config, input_res=res, comm_group=setup.model_comm_group)
+    graph_data=get_graph_data(config, input_res=res, hidden_res=setup.hidden_res, comm_group=setup.model_comm_group)
     datamodule = AnemoiDatasetsDataModule(config, graph_data) #need training just for this
     
     #keep cpu on cpu until we need it on device
@@ -307,7 +301,6 @@ def benchmark(models, setup, count=10, warmup=5):
         with profiler_wrapper(setup.device, "Warmup", model_name=model.name):
             for _ in range(0,warmup):
                 iter(model, setup)
-        torch.cuda.empty_cache()
         warmup_finish_time=time.time()
         if warmup > 0:
             LOG.info(f"{warmup} warmup iterations completed in {warmup_finish_time-start_time:.2f}s")
@@ -384,7 +377,7 @@ class Output:
 
 class Setup:
     def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None, save_checkpoint=False) -> None:
-        self.res = res
+        self.res, self.hidden_res = self.parse_res(res)
         self.dtype = dtype
         self.device = device
         self.bw=bw
@@ -397,7 +390,6 @@ class Setup:
         self.check_correctness=check_correctness
         self.slurm=slurm
         self.warn_about_syncs=False
-            #if self.bw #could check if FAv3 is in use and error out
         self.save_checkpoint=save_checkpoint
         
         if seed is None:
@@ -433,6 +425,20 @@ class Setup:
         if self.device == "cuda":
             self.device = f"cuda:{self.local_rank}"
             torch.cuda.set_device(torch.device(self.device))
+
+    #parses input list from the format: 'input_grid[,hidden_grid]'
+    #hidden_grid is optional, default is o96 for transformer
+    def parse_res(self,res):
+        default_hidden_res="o96"
+        res_list=res.split(",")
+        LOG.info(f"{res_list=}")
+        if len(res_list) >2:
+            raise ValueError(f"Error. {len(res)} resolutions provided! expected format is either '-r input_grid' or '-r input_grid,hidden_grid'")
+        if len(res_list) == 2:
+            return res_list[0], res_list[1]
+        if len(res_list) == 1:
+            return res_list[0], default_hidden_res
+        
             
     def reset_rng(self):
         torch.manual_seed(self.seed)
@@ -456,7 +462,8 @@ def init_parallel(use_slurm=False):
         global_rank = int(os.environ.get("SLURM_PROCID", 0))
         world_size = int(os.environ.get("SLURM_NTASKS", 1))
         local_rank = int(os.environ.get("SLURM_LOCALID", 0))
-        procs_per_node = int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0]) #in the form "NTASKS(xNNODES),"
+        procs_per_node =int(os.environ.get("SLURM_TASKS_PER_NODE", '1').split('(')[0].rstrip(',')) #in the form "NTASKS(xNNODES),"
+        #rstrip bc some single node jobs are '4,'
     else:
         global_rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
