@@ -98,14 +98,15 @@ def build_config(setup):
         hardware_list=[f"hardware.paths.data='{hardware_paths_data}'", f"hardware.files.dataset='{hardware_files_dataset}'"]
         parallel_list=[f"hardware.num_gpus_per_node={setup.procs_per_node}", f"hardware.num_nodes={setup.num_nodes}"]
         ignore_list=["diagnostics.log.wandb.entity=''", "diagnostics.log.mlflow.tracking_uri=''", "hardware.paths.output=''", "hardware.files.graph=''"]
-        overrides= hardware_list + parallel_list + ignore_list
+        dates_list=["dataloader.training.end=2023", "dataloader.validation.start=2023", "dataloader.validation.end=2023"]
+        overrides= hardware_list + parallel_list + ignore_list + dates_list
         config = compose(config_name=setup.config_name, overrides=overrides)
         
     LOG.debug(f"{config=}")
     config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
     
     #change the setup slightly for o1280
-    if setup.res == "o1280":
+    if setup.res == "o1280" or setup.res == "o2560":
         config.data.forcing = list(config.data.forcing).remove("insolation")
         config.data.normalizer.none = list(config.data.normalizer.none).remove("insolation")
         #config.model.num_channels=256 #can run 128 on 1 40GB A100, or 256 on 4
@@ -327,7 +328,7 @@ def benchmark(models, setup, count=10, warmup=5):
                     results = iter(model,setup)
                     
                 if setup.check_correctness:
-                    output.record(i, *results)
+                    output.record(i, *results, backward=setup.bw)
                     #runtime goes from 18s to 25s with emptying the cache each iter
                     torch.cuda.empty_cache() #big perf hit but for some reason my mem pressure has increased when checking correctness
                     #but it gets it through the correctness checks
@@ -355,7 +356,7 @@ def benchmark(models, setup, count=10, warmup=5):
     if setup.check_correctness: 
         #LOG.info(f"{outputs[0] == outputs[1]=}")
         LOG.info(f"Checking correctness... (on the CPU, so relatively slow)")
-        outputs[0].compare(outputs[1])
+        outputs[0].compare(outputs[1], backward=setup.bw)
         
 class Output:
     def __init__(self, len,dtype):
@@ -370,28 +371,30 @@ class Output:
         grad_matches=torch.allclose(self.grad, other.grad)
         return y_pred_matches and loss_matches and grad_matches
     
-    def compare(self, other):
+    def compare(self, other, backward=True):
         y_pred_matches=torch.allclose(self.y_pred, other.y_pred)
-        loss_matches=torch.allclose(self.loss, other.loss)
-        grad_matches=torch.allclose(self.grad, other.grad)
-        if not grad_matches:
-            grad_absdiff = torch.abs(self.grad) - torch.abs(other.grad)
-            #vmap_allclose = torch.vmap(torch.allclose)
-            #grad_matches_per_step = vmap_allclose(self.grad, other.grad)
-            LOG.info(f"{torch.max(grad_absdiff)=}")
-        LOG.info(f"{y_pred_matches=}, {loss_matches=}, {grad_matches=}")
+        if backward:
+            loss_matches=torch.allclose(self.loss, other.loss)
+            grad_matches=torch.allclose(self.grad, other.grad)
+            if not grad_matches:
+                grad_absdiff = torch.abs(self.grad) - torch.abs(other.grad)
+                LOG.info(f"{torch.max(grad_absdiff)=}")
+            LOG.info(f"{y_pred_matches=}, {loss_matches=}, {grad_matches=}")
+        else:
+            LOG.info(f"{y_pred_matches=}")
     
-    def record(self, i, y_pred,loss,grad):
+    def record(self, i, y_pred,loss,grad, backward=True):
         #TODO remove pinned memory allocation from the benchmark path
         if self.y_pred is None:
             self.y_pred = torch.empty((self.len,*y_pred.shape), dtype=y_pred.dtype, device="cpu", pin_memory=True)
-        if self.loss is None:
+        if self.loss is None and backward: #if we havent allocated loss, and if we are running in BW mode
             self.loss = torch.empty((self.len,*loss.shape), dtype=loss.dtype, device="cpu", pin_memory=True)
-        if self.grad is None:
+        if self.grad is None and backward:
             self.grad = torch.empty((self.len,*grad.shape), dtype=grad.dtype, device="cpu", pin_memory=True)
         self.y_pred[i]=y_pred
-        self.loss[i]=loss
-        self.grad[i]=grad
+        if backward:
+            self.loss[i]=loss
+            self.grad[i]=grad
 
 class Setup:
     def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None, save_checkpoint=False, warn_about_syncs=False) -> None:
