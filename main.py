@@ -289,6 +289,34 @@ def save_inf_checkpoint(model,setup):
     if setup.global_rank == 0:
         save_inference_checkpoint(model, metadata, f"{save_path}/{file_name}")
         LOG.info(f"Checkpoint saved to '{save_path}/inference-{file_name}'")
+
+def print_model_summary( model, setup):
+    example_input_array = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size, generator=None)
+    from torchinfo import summary
+
+    # when using flash attention model, we need to convert the input and model to float16 and cuda
+    # since FlashAttention only supports fp16 and bf16 data type
+    example_input_array = example_input_array.to(dtype=torch.float16)
+    example_input_array = example_input_array.to("cuda")
+    model.half()
+    model = model.to("cuda")
+
+    summary_str = str(
+        summary(
+            model,
+            input_data=example_input_array,
+            depth=20,
+            col_width=16,
+            col_names=["trainable", "input_size", "output_size", "num_params", "params_percent", "mult_adds"],
+            row_settings=["var_names"],
+            verbose=0,
+        ),
+    )
+    LOG.info(summary_str)
+    #self.model_summary_fname = self.dirpath / "model_summary.txt"
+    #self._save_model_summary(summary_str, self.model_summary_fname)
+    return summary_str
+
     
 def benchmark(models, setup, count=10, warmup=5):
     outputs=[]
@@ -351,6 +379,8 @@ def benchmark(models, setup, count=10, warmup=5):
 
         if setup.warn_about_syncs:
             torch.cuda.set_sync_debug_mode(0)
+        
+        print_model_summary(model, setup)
             
     
     if setup.check_correctness: 
