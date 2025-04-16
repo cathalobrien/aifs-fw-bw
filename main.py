@@ -18,7 +18,6 @@ from anemoi.models.interface import AnemoiModelInterface
 from hydra import compose, initialize
 from omegaconf import OmegaConf
 from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
-from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema, convert_to_omegaconf
 from hydra.utils import instantiate
 
 #loss
@@ -103,7 +102,11 @@ def build_config(setup):
         config = compose(config_name=setup.config_name, overrides=overrides)
         
     LOG.debug(f"{config=}")
-    config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
+    try: 
+        from anemoi.training.schemas.base_schema import BaseSchema, UnvalidatedBaseSchema
+        config=UnvalidatedBaseSchema(**config) #using Baseschema instantiaes all the objects early for some reason
+    except ModuleNotFoundError:
+        OmegaConf.resolve(config)
     
     #change the setup slightly for o1280
     if setup.res == "o1280" or setup.res == "o2560":
@@ -122,7 +125,13 @@ def get_graph_data(config, input_res="n320", hidden_res="o96", comm_group=None):
 
     if not graph_filename.exists():
         LOG.info(f"'{graph_filename}' not found. Building it...")
-        graph_config = convert_to_omegaconf(config).graph
+
+        #dealing with older versions of training before BaseSchema
+        try:
+            from anemoi.training.schemas.base_schema import convert_to_omegaconf
+            graph_config = convert_to_omegaconf(config).graph
+        except ModuleNotFoundError:
+            graph_config = config.graph
 
         #if "nodes.hidden.node_builder.grid" in graph_config:
         #    graph_config.nodes.hidden.node_builder.grid = hidden_res
@@ -154,9 +163,11 @@ def get_graph_data(config, input_res="n320", hidden_res="o96", comm_group=None):
     
 
 def get_loss(config, data_indices,device):
+    #when using an older anemoi without BaseSchemas and omegaconf instead, we dont have model_dump and it only takes config and data indices
     variable_scaling = GraphForecaster.get_variable_scaling(
-            config.model_dump(by_alias=True).training.variable_loss_scaling,
-            config.model_dump(by_alias=True).training.pressure_level_scaler,
+            #config.model_dump(by_alias=True).training.variable_loss_scaling,
+            #config.model_dump(by_alias=True).training.pressure_level_scaler,
+            config,
             data_indices,
         )
 
@@ -206,8 +217,10 @@ def build_model(setup):
     model.loss = get_loss(config, datamodule.data_indices, device)
     
     #needed for sharded batch
+    #when using an older anemoi without BaseSchemas and omegaconf instead, we dont have model_dump 
     model.grid_indices = instantiate(
-        config.model_dump(by_alias=True).dataloader.grid_indices,
+        #config.model_dump(by_alias=True).dataloader.grid_indices,
+        config.dataloader.grid_indices,
         reader_group_size=setup.world_size,)
     model.grid_indices.setup(graph_data) # need a loaded graph here
     model.name = f"{setup.config_name}"
@@ -216,9 +229,7 @@ def build_model(setup):
     
 def iter(model,setup, verbose=False, generator=None):
     with profiler_wrapper(setup.device, "Generate inputs", model_name=model.name):
-        x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=setup.world_size, generator=generator)
-    grid_shard_shapes = model.grid_indices.shard_shapes
-    grid_shard_slice = model.grid_indices.get_shard_indices(setup.global_rank)
+        x = generate_inputs(res=setup.res,device=setup.device, grad=setup.bw, dtype=setup.dtype, world_size=1, generator=generator)
     
     #without torch.autocast(dtype=torch.float16) I got an error in FW pass
     #     File "/perm/naco/venvs/aifs-fw-bw/lib/python3.11/site-packages/flash_attn/flash_attn_interface.py", line 96, in _flash_attn_forward
@@ -227,7 +238,7 @@ def iter(model,setup, verbose=False, generator=None):
     #       RuntimeError: FlashAttention only support fp16 and bf16 data type
     with torch.autocast(device_type=setup.device, dtype=setup.dtype):
         with profiler_wrapper(setup.device, "Forward", model_name=model.name):
-            y_pred=model.model.forward(x, model_comm_group=setup.model_comm_group, grid_shard_slice=grid_shard_slice, grid_shard_shapes=grid_shard_shapes)
+            y_pred=model.model.forward(x, model_comm_group=setup.model_comm_group )
             
         if setup.bw:
             with profiler_wrapper(setup.device,"Loss", model_name=model.name):
@@ -318,7 +329,7 @@ def print_model_summary( model, setup):
     return summary_str
 
     
-def benchmark(models, setup, count=10, warmup=5):
+def benchmark(models, setup, count=20, warmup=5):
     outputs=[]
 
     #generator=torch.Generator(device=setup.device)
@@ -380,7 +391,7 @@ def benchmark(models, setup, count=10, warmup=5):
         if setup.warn_about_syncs:
             torch.cuda.set_sync_debug_mode(0)
         
-        print_model_summary(model, setup)
+        #print_model_summary(model, setup)
             
     
     if setup.check_correctness: 
