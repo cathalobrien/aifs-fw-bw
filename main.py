@@ -380,7 +380,7 @@ def benchmark(models, setup, count=10, warmup=5):
         if setup.warn_about_syncs:
             torch.cuda.set_sync_debug_mode(0)
         
-        print_model_summary(model, setup)
+        #print_model_summary(model, setup)
             
     
     if setup.check_correctness: 
