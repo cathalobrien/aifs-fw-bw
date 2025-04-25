@@ -318,7 +318,7 @@ def print_model_summary( model, setup):
     return summary_str
 
     
-def benchmark(models, setup, count=10, warmup=5):
+def benchmark(models, setup, count=20, warmup=5):
     outputs=[]
 
     #generator=torch.Generator(device=setup.device)
@@ -379,8 +379,9 @@ def benchmark(models, setup, count=10, warmup=5):
 
         if setup.warn_about_syncs:
             torch.cuda.set_sync_debug_mode(0)
-        
-        #print_model_summary(model, setup)
+
+        if setup.print_model_summary:
+            print_model_summary(model, setup)
             
     
     if setup.check_correctness: 
@@ -442,6 +443,7 @@ class Setup:
         self.slurm=slurm
         self.warn_about_syncs=warn_about_syncs
         self.save_checkpoint=save_checkpoint
+        self.print_model_summary=False
         
         if seed is None:
             self.seed = int(time.time())
