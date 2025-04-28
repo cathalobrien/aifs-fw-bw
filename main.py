@@ -431,7 +431,10 @@ class Setup:
     def __init__(self, res, dtype=torch.float16, device="cuda:0", bw=True, mem_snapshot=False, config_path="config/", configs="hackathon", channels=128, torch_profiler=True, compile=False, slurm=False, check_correctness=False, seed=None, save_checkpoint=False, warn_about_syncs=False) -> None:
         self.res, self.hidden_res = self.parse_res(res)
         self.dtype = dtype
-        self.device = device
+        if torch.cuda.is_available():
+            self.device = device
+        else:
+            self.device = "cpu"
         self.bw=bw
         self.mem_snapshot=mem_snapshot #has a slight perf impact (4.79s vs 5.29s for 10 n320 FW passes)
         self.config_path=config_path
@@ -465,8 +468,6 @@ class Setup:
                 raise ValueError("Error! You are running with correctness checks disabled, but 'CUBLAS_WORKSPACE_CONFIG=:16:8'. This will decrease performance. Please unset and rerun.")
 
         #init parallel
-        if self.device != "cuda":
-            raise ValueError("device=Cuda hardcoded in init_parallel")
         self.model_comm_group, self.global_rank, self.world_size, self.procs_per_node, self.num_nodes, self.local_rank = init_parallel(self.slurm)
 
         self.mem_snapshot = self.mem_snapshot and (self.global_rank == 0)
@@ -532,8 +533,10 @@ def init_parallel(use_slurm=False):
             except subprocess.CalledProcessError as err:
                 master_addr="localhost"
 
-            #TODO remove hardcoded cuda here
-            dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+            if torch.cuda.is_available():
+                dist.init_process_group(backend="nccl", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank, device_id=torch.device(f"cuda:{local_rank}"))
+            else:
+                dist.init_process_group(backend="gloo", init_method=f"tcp://{master_addr}:{master_port}", world_size=world_size, rank=global_rank)
         else:
             dist.init_process_group(backend="nccl",device_id=torch.device(f"cuda:{local_rank}"))
         model_comm_group_ranks = np.arange(world_size, dtype=int)
